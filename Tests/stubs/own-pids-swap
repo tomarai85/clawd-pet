@@ -1,0 +1,22 @@
+#!/bin/sh
+# Stub for the uninstall race: the process list changes between the CLI's first listing and the signal it was about to send.
+# The first call lists the unrelated process STUB_SWAP_PID as if it were the installed agent (path and start time matching).
+# Every later call (the identity check right before a signal, the listing after the grace period, the final wait) answers by
+# STUB_SWAP_MODE:
+#   absent      the process is gone (it exited on its own)
+#   restarted   the same pid now has another start time (the pid was reused by a different process)
+# Every call is recorded in STUB_OWN_LOG; the call counter lives in STUB_SWAP_COUNT.
+echo "$*" >> "$STUB_OWN_LOG"
+count=$(cat "$STUB_SWAP_COUNT" 2>/dev/null || echo 0)
+count=$((count + 1))
+echo "$count" > "$STUB_SWAP_COUNT"
+if [ "$count" -eq 1 ]; then
+  echo "PID $STUB_SWAP_PID 1111 2222"
+  echo "OWN-PIDS 1"
+  exit 0
+fi
+case "$STUB_SWAP_MODE" in
+  restarted) echo "PID $STUB_SWAP_PID 1111 9999"; echo "OWN-PIDS 1" ;;
+  *) echo "OWN-PIDS 0" ;;
+esac
+exit 0

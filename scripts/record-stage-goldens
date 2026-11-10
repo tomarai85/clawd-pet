@@ -1,0 +1,8 @@
+#!/bin/sh
+# Re-records the v2 stage goldens (Tests/Goldens/motions, looks, transition, bubble) through the production renderer.
+# The comparison tests then pass against the new pictures. Look at `git diff --stat Tests/Goldens` before committing them.
+# v1's eight scene goldens are recorded by scripts/record-goldens, not here.
+set -eu
+repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$repo"
+CLAWD_RECORD_STAGE_GOLDENS=1 swift test --disable-index-store --filter "Golden_motionFramesInThePlainLook|Golden_lookRestPoses|Golden_lookTransitionFrames|Golden_bubbleStyleTimesScenes|Golden_bubbleSideAndLargerSizes|BubbleStyleGoldenTests"

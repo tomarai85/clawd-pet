@@ -1,0 +1,5 @@
+#!/bin/sh
+# The repo build in the interrupt tests: what uninstall falls back to when the installed agent is missing.
+# Logs that the repo copy answered, then runs the real agent so that --own-pids is the real enumeration for this HOME.
+echo repo >> "${STUB_ENUM_LOG:-/dev/null}"
+exec "$CLAWD_TEST_REAL_AGENT" "$@"

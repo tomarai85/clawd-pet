@@ -1,0 +1,11 @@
+[2026-10-17T00:00:00.000Z] [info]  (Main)                                   app.bootstrap
+[2026-10-17T00:00:00.010Z] [error] (SystemBridge)                           Bridge stderr: LLVM Profile Error
+[2026-10-17T00:00:00.020Z] [warn]  (Main)                                   Unknown message type {
+  success: true
+}
+[2026-10-17T00:00:01.000Z] [info]  (DictationOrchestrator)                  dictation.lock_accepted lease_id=2 provider=online
+[2026-10-17T00:00:02.000Z] [info]  (DictationOrchestrator)                  dictation.cancel_accepted lease_id=2
+[2026-10-17T00:00:02.100Z] [info]  (DictationOrchestrator)                  dictation.completed_canceled_stale lease_id=2
+[2026-10-17T00:00:03.000Z] [warn]  (DictationRuntimeAdapter)                dictation.native_audio_capture_failed lease_id=3
+[2026-10-17T00:00:04.000Z] [error]                                          Audio capture stopped unexpectedly
+[2026-10-17T00:00:05.000Z] [info]  (SystemBridge)                           Shutdown initiated

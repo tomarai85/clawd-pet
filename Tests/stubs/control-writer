@@ -1,0 +1,21 @@
+#!/usr/bin/perl
+# A second, independent implementation of the settings writer protocol (spec 5.1), standing in for the menu's writer path:
+# exclusive flock(2) on $ROOT/control.lock, read control.json, change one key, generation + 1, write control.json.partial, rename it
+# over control.json, release. It never creates the lock file.
+#   control-writer ROOT KEY VALUE      VALUE is true, false, an integer or a string
+use strict; use warnings;
+use Fcntl qw(:flock); use JSON::PP;
+my ($root, $key, $value) = @ARGV;
+open(my $lock, '<', "$root/control.lock") or die "no control.lock: $!\n";
+flock($lock, LOCK_EX) or die "flock: $!\n";
+open(my $in, '<', "$root/control.json") or die "control.json: $!\n";
+my $text = do { local $/; <$in> }; close $in;
+my $data = JSON::PP->new->decode($text);
+my $generation = $data->{generation}; $generation = 0 unless defined $generation && $generation =~ /^\d+$/;
+$data->{generation} = $generation + 1;
+if ($value eq 'true') { $data->{$key} = JSON::PP::true } elsif ($value eq 'false') { $data->{$key} = JSON::PP::false }
+elsif ($value =~ /^-?\d+$/) { $data->{$key} = $value + 0 } else { $data->{$key} = "$value" }
+open(my $out, '>', "$root/control.json.partial") or die "partial: $!\n";
+print $out JSON::PP->new->canonical->encode($data), "\n"; close $out or die "close: $!\n";
+rename("$root/control.json.partial", "$root/control.json") or die "rename: $!\n";
+close $lock;

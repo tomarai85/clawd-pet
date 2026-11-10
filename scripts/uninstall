@@ -1,0 +1,5 @@
+#!/bin/sh
+# Removes exactly what install recorded (the manifest, or the ownership marker when an install was interrupted before its manifest).
+set -eu
+repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+exec /bin/bash "$repo/bin/clawd-pet" uninstall

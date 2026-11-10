@@ -1,0 +1,21 @@
+#!/bin/bash
+# Test wrapper for scripts/lsof-replay-check.sh (CLAWD_LSOF): the real lsof, plus one synthetic descriptor record appended to the
+# listing of the replayed agent only (the process whose command line carries --test-replay), chosen by CLAWD_LSOF_INJECT:
+#   nonread   a write-mode descriptor on a path under "Library/Logs/Aqua Voice"
+#   net       an IPv4 socket
+# With CLAWD_LSOF_INJECT unset it is a transparent pass-through, which the test proves first.
+real=/usr/sbin/lsof
+"$real" "$@"
+rc=$?
+pid=""; previous=""
+for argument in "$@"; do
+  [ "$previous" = "-p" ] && pid="$argument"
+  previous="$argument"
+done
+if [ -n "$pid" ] && /bin/ps -p "$pid" -o args= 2>/dev/null | /usr/bin/grep -q -e '--test-replay'; then
+  case "${CLAWD_LSOF_INJECT:-}" in
+    nonread) printf 'f99\naw\ntREG\nn/Users/fake/Library/Logs/Aqua Voice/main.log\n' ;;
+    net) printf 'f98\nau\ntIPv4\nn127.0.0.1:50000->127.0.0.1:50001\n' ;;
+  esac
+fi
+exit $rc

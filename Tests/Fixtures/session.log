@@ -1,0 +1,4 @@
+[2026-10-17T00:00:00.000Z] [info]  (DictationOrchestrator)                  dictation.start_accepted lease_id=1 provider=online
+[2026-10-17T00:00:00.100Z] [info]  (DictationOrchestrator)                  dictation.lock_accepted lease_id=1 provider=online
+[2026-10-17T00:00:02.000Z] [info]  (DictationOrchestrator)                  dictation.completed has_audio_data=true lease_id=1 result_source=live text_length=12
+[2026-10-17T00:00:02.800Z] [info]  (IPCFloating)                            PASTE_ACK received { success: true }

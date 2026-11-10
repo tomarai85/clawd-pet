@@ -1,0 +1,8 @@
+#!/bin/sh
+# An enumerator that fails (exit 2) for its first STUB_FLAKY_FAILS calls, then runs the real enumeration of the installed agent.
+# The call counter lives in STUB_FLAKY_COUNT. This is the transient failure a process caught mid-exec causes in the real one.
+count=$(cat "$STUB_FLAKY_COUNT" 2>/dev/null || echo 0)
+count=$((count + 1))
+echo "$count" > "$STUB_FLAKY_COUNT"
+if [ "$count" -le "${STUB_FLAKY_FAILS:-0}" ]; then echo "OWN-PIDS enumeration failed" >&2; exit 2; fi
+exec "$HOME/Library/Application Support/clawd-pet/bin/clawd-pet-agent" "$@"

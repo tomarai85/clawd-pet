@@ -1,0 +1,447 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clawd Pet Preview</title>
+<meta name="description" content="Animated mock of every Clawd pet scene, built from elements extracted from Claude Code.">
+<meta name="robots" content="noindex, nofollow">
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --z: 2;
+    --page: #0c0e13;
+    --card: #151822;
+    --line: #272c3a;
+    --ink: #e9eaf0;
+    --muted: #9aa1b2;
+    --desk-a: #1c2231;
+    --desk-b: #0d1017;
+    --claude: rgb(215,119,87);
+    --claude-shimmer: rgb(235,159,127);
+    --inactive: rgb(153,153,153);
+    --prompt-border: rgb(136,136,136);
+    --error: rgb(255,107,128);
+    --mono: "SF Mono", SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  html { color-scheme: dark; }
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--ink);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 24px 16px 56px; }
+  h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: 0.2px; }
+  .lede { color: var(--muted); margin: 0 0 16px; max-width: 70ch; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin: 0 0 20px; color: var(--muted); font-size: 13px; }
+  .controls button, .controls select {
+    background: var(--card); color: var(--ink); border: 1px solid var(--line); border-radius: 8px;
+    padding: 6px 12px; font: inherit; cursor: pointer; min-height: 34px;
+  }
+  .controls button:hover, .controls select:hover { border-color: #3b4254; }
+  h2.section { font-size: 13px; letter-spacing: 1.4px; text-transform: uppercase; color: var(--muted); margin: 28px 0 10px; font-weight: 600; }
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr)); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; min-width: 0; }
+  .card h3 { margin: 0; font-size: 15px; letter-spacing: 1px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+  .card h3 small { font-size: 12px; letter-spacing: 0; color: var(--muted); font-weight: 400; }
+  .trig { margin: 4px 0 10px; color: var(--muted); font-size: 12.5px; font-family: var(--mono); overflow-wrap: anywhere; }
+  .note { margin: 10px 0 0; color: var(--muted); font-size: 12.5px; }
+  .stage {
+    position: relative; display: flex; align-items: center; gap: calc(6px * var(--z));
+    padding: calc(6px * var(--z)) calc(10px * var(--z));
+    min-height: calc(66px * var(--z));
+    border-radius: 10px; overflow: hidden;
+    background:
+      radial-gradient(120% 140% at 12% 0%, rgba(120,140,220,0.16), transparent 55%),
+      linear-gradient(160deg, var(--desk-a), var(--desk-b));
+    border: 1px solid #1f2535;
+  }
+  .clawd {
+    flex: none; width: calc(48px * var(--z)); height: calc(48px * var(--z));
+    image-rendering: crisp-edges; image-rendering: pixelated;
+  }
+  .chip {
+    flex: 0 1 auto; min-width: 0;
+    background: rgba(18,19,24,0.84);
+    border: 1px solid rgba(255,255,255,0.09);
+    border-radius: calc(8px * var(--z));
+    padding: calc(5px * var(--z)) calc(9px * var(--z));
+    font: calc(13px * var(--z))/1.35 var(--mono);
+    white-space: pre; overflow: hidden;
+    opacity: 1; transition: opacity 0.4s ease;
+    color: #f2f2f2;
+  }
+  .chip.hidden { opacity: 0; visibility: hidden; }
+  .chip.fade { opacity: 0; }
+  .glyph { display: inline-block; width: 2ch; }
+  .dim { color: var(--inactive); }
+  .claude { color: var(--claude); }
+  .sh { color: var(--claude-shimmer); }
+  .err { color: var(--error); }
+  .input {
+    display: inline-flex; align-items: center; gap: 1ch;
+    border: 1px solid var(--prompt-border); border-radius: calc(7px * var(--z));
+    padding: calc(2px * var(--z)) calc(8px * var(--z)); min-width: 16ch;
+  }
+  .cursor { display: inline-block; width: 1ch; height: 1.15em; background: #f2f2f2; vertical-align: text-bottom; }
+  .cursor.off { background: transparent; }
+  .badge { display: inline-block; font: 11px var(--mono); color: var(--muted); border: 1px solid var(--line); border-radius: 6px; padding: 0 6px; margin-left: 2px; }
+  .size-strip { display: flex; align-items: flex-end; gap: 28px; flex-wrap: wrap; padding: 18px; background: linear-gradient(160deg, var(--desk-a), var(--desk-b)); border: 1px solid #1f2535; border-radius: 12px; }
+  .size-item { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+  .size-item .cap { font-size: 12px; color: var(--muted); max-width: 22ch; }
+  .rs-clawd { width: 48px; height: 48px; image-rendering: pixelated; display: block; }
+  .rs-chip { font: 13px/1.35 var(--mono); padding: 5px 9px; border-radius: 8px; background: rgba(18,19,24,0.84); border: 1px solid rgba(255,255,255,0.09); white-space: pre; color: #f2f2f2; }
+  .aqua-box { width: 120px; height: 120px; border: 1.5px dashed #6b7288; border-radius: 14px; display: flex; align-items: center; justify-content: center; text-align: center; color: var(--muted); font-size: 12px; padding: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; width: 34%; }
+  td code, .mono { font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; }
+  .swatch { display: inline-block; width: 11px; height: 11px; border-radius: 3px; vertical-align: -1px; margin-right: 6px; border: 1px solid rgba(255,255,255,0.2); }
+  .scroll { overflow-x: auto; }
+  .chips { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); }
+  .chips .row { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; padding: 12px; border-radius: 10px; border: 1px solid #1f2535; background: linear-gradient(160deg, var(--desk-a), var(--desk-b)); min-width: 0; }
+  .chips .row .cap { font-size: 12px; color: var(--muted); }
+  .chips .chip { display: inline-block; opacity: 1; font-size: 13px; padding: 5px 9px; border-radius: 8px; max-width: 100%; }
+  .chips .input { border-radius: 7px; padding: 2px 8px; }
+  .frames { display: grid; gap: 10px; }
+  .frow { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; padding: 10px 12px; border: 1px solid #1f2535; border-radius: 10px; background: linear-gradient(160deg, var(--desk-a), var(--desk-b)); }
+  .frow .name { width: 9.5em; font: 12.5px var(--mono); color: var(--ink); }
+  .frow .name small { display: block; color: var(--muted); font-size: 11px; }
+  .frow figure { margin: 0; text-align: center; }
+  .frow img { width: 96px; height: 96px; image-rendering: crisp-edges; image-rendering: pixelated; display: block; }
+  .frow figcaption { font: 11px var(--mono); color: var(--muted); }
+  footer { margin-top: 28px; color: var(--muted); font-size: 12.5px; }
+  @media (max-width: 560px) {
+    .wrap { padding: 18px 16px 44px; }
+    .frow .name { width: 100%; }
+    .size-strip { gap: 18px; padding: 14px; }
+    th { width: 40%; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Clawd Pet Preview</h1>
+  <p class="lede">A display-only mock of every scene in the Clawd pet spec (section 2), on a dark desktop. Frames are the generated pixel art; the text chip uses glyphs, verbs, timings and colors read out of the installed Claude Code binary. No network, no Aqua text.</p>
+  <div class="controls">
+    <button id="pause" type="button" aria-pressed="false">Pause</button>
+    <label>Zoom
+      <select id="zoom">
+        <option value="auto">Auto</option>
+        <option value="1">1x (real size)</option>
+        <option value="2">2x</option>
+        <option value="3">3x</option>
+      </select>
+    </label>
+    <span id="status"></span>
+  </div>
+
+  <h2 class="section">Whole dictation</h2>
+  <div class="grid" id="flow-grid"></div>
+
+  <h2 class="section">Scenes</h2>
+  <div class="grid" id="scenes"></div>
+
+  <h2 class="section">Optional helmet variant (off by default)</h2>
+  <div class="grid" id="helmet"></div>
+
+  <h2 class="section">Chip states (static samples)</h2>
+  <div class="chips" id="chips-static">
+    <div class="row"><div class="chip"><span class="input"><span class="dim">❯</span><span class="cursor"></span></span></div><span class="cap">LISTENING: input box, gray round border, blinking cursor</span></div>
+    <div class="row"><div class="chip"><span class="glyph claude">✻</span><span class="claude">Clau</span><span class="sh">din</span><span class="claude">g…</span> </div><span class="cap">THINKING: orange glyph + verb, shimmer window of 3 characters</span></div>
+    <div class="row"><div class="chip"><span class="glyph dim">✻</span><span class="dim">Cooked for 5s</span></div><span class="cap">SENT: turn-complete line, dim</span></div>
+    <div class="row"><div class="chip"><span class="dim">  ⎿  Interrupted</span></div><span class="cap">INTERRUPTED: dim, 1.5 s</span></div>
+    <div class="row"><div class="chip"><span class="dim">  ⎿  </span><span class="err">Error</span></div><span class="cap">ERROR: error color, 1.5 s</span></div>
+  </div>
+
+  <h2 class="section">All frames</h2>
+  <div class="frames" id="frames-static"><!--__FRAMES__--></div>
+
+  <h2 class="section">Real size</h2>
+  <div class="size-strip" id="size-strip">
+    <div class="size-item"><img class="rs-clawd" id="rs-img" alt="Clawd at real size" src="frames4x/idle_0.png"><span class="cap">Clawd, 4 pt per unit: 48 x 48 pt (12 units wide, arms included; body 32 pt)</span></div>
+    <div class="size-item"><div class="rs-chip" id="rs-chip"><span class="glyph claude">✻</span><span class="claude">Clauding…</span></div><span class="cap">Text chip, 13 pt monospace</span></div>
+    <div class="size-item"><div class="aqua-box">Aqua's slime size<br>120 x 120 pt</div><span class="cap">1 CSS px = 1 pt on a Mac display. Use Zoom 1x to see this at true size.</span></div>
+  </div>
+
+  <h2 class="section">Extracted from Claude Code <span id="ver"></span></h2>
+  <div class="card scroll"><table id="facts"></table></div>
+
+  <footer>Spec: spec-clawd-pet-2026-10-16.md. Chip never shows dictated text (R7). Cursor blink rate (530 ms) is an assumption; the binary does not expose it.</footer>
+</div>
+
+<script>
+const DATA = /*__DATA__*/null;
+const ATLAS = DATA.atlas, EL = DATA.elements;
+
+// ---- theme colors from the extracted dark palette
+(function(){
+  const r = document.documentElement.style, t = EL.theme;
+  r.setProperty('--claude', t.claude); r.setProperty('--claude-shimmer', t.claudeShimmer);
+  r.setProperty('--inactive', t.inactive); r.setProperty('--prompt-border', t.promptBorder);
+  r.setProperty('--error', t.error);
+})();
+
+// ---- virtual clock + timers (pause-able, frame driven)
+let clock = 0, paused = false, last = performance.now();
+const timers = [];
+const tickers = new Set();
+function later(ms, fn) { const t = { at: clock + ms, fn, dead: false }; timers.push(t); return t; }
+function cancel(t) { if (t) t.dead = true; }
+function frame(now) {
+  const dt = Math.min(now - last, 100); last = now;
+  if (!paused) {
+    clock += dt;
+    for (let i = 0; i < timers.length; i++) {
+      const t = timers[i];
+      if (t.dead) { timers.splice(i--, 1); continue; }
+      if (t.at <= clock) { timers.splice(i--, 1); try { t.fn(); } catch (e) { console.error(e); } }
+    }
+    tickers.forEach(fn => fn());
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+const rnd = (a, b) => a + Math.random() * (b - a);
+const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+const esc = s => s.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+const GL = EL.glyphs; // ["·","✢","✳","✶","✻","✽"]
+const nn = ms => { // Claude Code's duration format
+  const s = Math.floor(ms / 1000); if (s < 60) return s + 's';
+  const m = Math.floor(s / 60); return m + 'm ' + (s % 60) + 's';
+};
+
+// ---- Stage: Clawd image + chip
+class Stage {
+  constructor(root) {
+    this.root = root; this.img = root.querySelector('.clawd'); this.chip = root.querySelector('.chip');
+    this.gen = 0; this.frameTimer = null; this.ticker = null; this.blinkTimer = null; this.chipTimers = [];
+    this.pose('idle');
+  }
+  src(name, i) { return ATLAS.poses[name].frames[i].replace('frames/', 'frames4x/'); }
+  pose(name, onend) {
+    cancel(this.frameTimer);
+    const p = ATLAS.poses[name]; let i = 0; this.current = name;
+    const step = () => {
+      this.img.src = this.src(name, i);
+      const ms = p.ms[i]; i++;
+      if (i >= p.frames.length) {
+        if (!p.loop) { this.frameTimer = later(ms, () => onend && onend()); return; }
+        if (p.frames.length === 1) return;
+        i = 0;
+      }
+      this.frameTimer = later(ms, step);
+    };
+    step();
+  }
+  idle(helm) { // idle with a blink every 3-7 s
+    const g = ++this.gen; const base = helm ? 'helmet-idle' : 'idle';
+    this.pose(base);
+    const loop = () => {
+      this.blinkTimer = later(rnd(3000, 7000), () => {
+        if (g !== this.gen) return;
+        if (!helm) { this.img.src = this.src('blink', 0); this.frameTimer = later(ATLAS.poses.blink.ms[0], () => { if (g === this.gen) this.img.src = this.src('idle', 0); }); }
+        loop();
+      });
+    };
+    loop();
+  }
+  reset() { this.gen++; cancel(this.blinkTimer); cancel(this.frameTimer); this.stopTicker(); this.chipTimers.forEach(cancel); this.chipTimers = []; }
+  stopTicker() { if (this.ticker) { tickers.delete(this.ticker); this.ticker = null; } }
+  chipHide() { this.stopTicker(); this.chip.classList.add('hidden'); this.chip.classList.remove('fade'); }
+  chipShow(html) { this.chip.innerHTML = html; this.chip.classList.remove('hidden', 'fade'); }
+  after(ms, fn) { const g = this.gen; const t = later(ms, () => { if (g === this.gen) fn(); }); this.chipTimers.push(t); return t; }
+
+  // chip builders
+  input() {
+    this.stopTicker();
+    this.chipShow(`<span class="input"><span class="dim">${EL.promptChar}</span><span class="cursor"></span></span>`);
+    const cur = this.chip.querySelector('.cursor'); const t0 = clock; let lastOn = null;
+    this.ticker = () => { const on = Math.floor((clock - t0) / 530) % 2 === 0; if (on !== lastOn) { lastOn = on; cur.classList.toggle('off', !on); } };
+    tickers.add(this.ticker);
+  }
+  spinner(verb) {
+    this.stopTicker();
+    const msg = verb + '…';
+    this.chipShow(`<span class="glyph claude"></span><span class="msg">${[...msg].map(c => `<span class="claude">${esc(c)}</span>`).join('')}</span> `);
+    const g = this.chip.querySelector('.glyph'), chars = [...this.chip.querySelectorAll('.msg span')];
+    const t0 = clock; let lastTick = -1, lastGl = -1, lastIdx = null, n = chars.length;
+    this.ticker = () => {
+      const t = clock - t0;
+      const tick = Math.floor(t / EL.clockTickMs) * EL.clockTickMs;           // 100 ms animation clock
+      const idx = Math.round(((1 - Math.cos(2 * Math.PI * tick / EL.periodMs)) / 2) * (GL.length - 1));
+      if (idx !== lastGl) { lastGl = idx; g.textContent = GL[idx]; }
+      const gi = (Math.floor(t / EL.shimmerStepMs) % (n + 2 * EL.shimmerPad)) - EL.shimmerPad; // "requesting" sweep, left to right
+      if (gi !== lastIdx) {
+        lastIdx = gi;
+        chars.forEach((c, k) => { c.className = (k >= gi - 1 && k <= gi + 1) ? 'sh' : 'claude'; });
+      }
+    };
+    this.ticker();
+    tickers.add(this.ticker);
+  }
+  sent(verb, ms) {
+    this.stopTicker();
+    this.chipShow(`<span class="glyph dim">${EL.doneGlyph}</span><span class="dim">${esc(verb)} for ${nn(ms)}</span>`);
+  }
+  line(kind) {
+    this.stopTicker();
+    if (kind === 'interrupted') this.chipShow(`<span class="dim">  ${EL.respGlyph}  ${esc(EL.interrupt)}</span>`);
+    else this.chipShow(`<span class="dim">  ${EL.respGlyph}  </span><span class="err">Error</span>`);
+  }
+}
+
+// ---- scene scripts (each loops by itself)
+const S = {};
+S.listening = st => { st.reset(); st.pose('listen'); st.input(); };
+S.thinking = st => {
+  st.reset(); st.pose('think');
+  const go = () => { st.spinner(pick(EL.verbs)); st.after(2600, go); };
+  go();
+};
+S.sent = st => {
+  st.reset(); st.chipHide(); st.idle();
+  const go = () => {
+    st.gen++; const g = st.gen;
+    st.pose('hop', () => { if (g === st.gen) st.idle(); });
+    st.sent(pick(EL.pastVerbs), Math.round(rnd(3, 70)) * 1000);
+    later(2000, () => { st.chip.classList.add('fade'); });
+    later(2500, () => { st.chipHide(); });
+    later(4200, () => { go(); });
+  };
+  go();
+};
+S.interrupted = st => {
+  st.reset(); st.idle(); st.chipHide();
+  const go = () => { st.line('interrupted'); later(1500, () => st.chipHide()); later(3800, go); };
+  later(400, go);
+};
+S.error = st => {
+  st.reset(); st.idle(); st.chipHide();
+  const go = () => { st.line('error'); later(1500, () => st.chipHide()); later(3800, go); };
+  later(400, go);
+};
+S.idle = st => { st.reset(); st.chipHide(); st.idle(); };
+S.sleep = st => { st.reset(); st.chipHide(); st.pose('sleep'); };
+S.drag = st => { st.reset(); st.pose('dangle'); st.chipHide(); };
+
+// full flow: IDLE -> LISTENING -> THINKING -> SENT -> IDLE
+S.flow = st => {
+  st.reset(); st.chipHide(); st.idle();
+  const cycle = () => {
+    later(2200, () => { st.reset(); st.pose('listen'); st.input(); });
+    later(2200 + 3200, () => { st.reset(); st.pose('think'); st.spinner(pick(EL.verbs)); });
+    later(2200 + 3200 + 2600, () => {
+      st.reset(); st.gen++; const g = st.gen;
+      st.pose('hop', () => { if (g === st.gen) st.idle(); });
+      st.sent(pick(EL.pastVerbs), Math.round(rnd(3, 40)) * 1000);
+    });
+    later(2200 + 3200 + 2600 + 2000, () => st.chip.classList.add('fade'));
+    later(2200 + 3200 + 2600 + 2500, () => { st.chipHide(); });
+    later(2200 + 3200 + 2600 + 4200, cycle);
+  };
+  cycle();
+};
+
+const SCENES = [
+  ['listening', 'LISTENING', 'lease opens: dictation.start_accepted | lock_accepted', 'Clawd looks toward the chip and bobs 1 unit (2 frames). Chip: the Claude Code input box, rounded gray border, prompt and a blinking cursor.'],
+  ['thinking', 'THINKING', 'key released: input device stops while a lease is open', 'Legs and arms shuffle on a 6-frame, 120 ms cycle. Chip: orange spinner glyph on a 2 s breathing curve (100 ms clock), a random verb with the orange shimmer sweep, and an ellipsis. A new verb every 2.6 s here (real minimum: 1.0 s).'],
+  ['sent', 'SENT', 'dictation.completed text_length>0 + PASTE_ACK success:true', 'One 2-unit hop. Chip: the turn-complete line (past-tense verb + dictation duration), dim, fades after 2 s.'],
+  ['interrupted', 'INTERRUPTED', 'cancel_accepted | completed_canceled* | text_length=0', 'Clawd stays put. Chip: Claude Code\'s interrupt line, dim, 1.5 s.'],
+  ['error', 'ERROR', 'start_failed | native_audio_capture_failed | owner_lost_during_session | microphone_stopped', 'Clawd stays put. Chip: red error line, 1.5 s.'],
+  ['idle', 'IDLE', 'none of the above', 'Still, blink every 3-7 s. Chip hidden: the idle footprint is Clawd only.'],
+  ['sleep', 'SLEEP', '10 min without events', 'Eyes closed as short lines, arms drooped. One frame, no timer. Chip hidden.'],
+  ['drag', 'DRAG', 'mouse drag on Clawd', 'Held up: arms raised, legs dangle (2 frames). Chip unchanged (hidden here).'],
+];
+
+const stages = [];
+function card(id, title, trig, note, extra) {
+  const el = document.createElement('section'); el.className = 'card';
+  el.innerHTML = `<h3>${title}${extra || ''}</h3><p class="trig">${esc(trig)}</p>
+    <div class="stage"><img class="clawd" alt="Clawd, scene ${title}" width="48" height="48" src="frames4x/idle_0.png"><div class="chip hidden"></div></div>
+    <p class="note">${esc(note)}</p>`;
+  return el;
+}
+(function build() {
+  const flowGrid = document.getElementById('flow-grid');
+  const f = card('flow', 'FLOW', 'IDLE, then LISTENING, THINKING, SENT, then IDLE', 'The sequence the user sees for one dictation: hold the key, release, text lands.', '');
+  flowGrid.appendChild(f); stages.push([new Stage(f.querySelector('.stage')), 'flow']);
+  const grid = document.getElementById('scenes');
+  SCENES.forEach(([id, title, trig, note]) => {
+    const el = card(id, title, trig, note); grid.appendChild(el);
+    stages.push([new Stage(el.querySelector('.stage')), id]);
+  });
+  const hg = document.getElementById('helmet');
+  [['helmet-idle', 'HELMET IDLE', 'helmet variant, off by default', 'Clear round glass dome around the head (Clawd\'s head is the whole body block): thin light-blue rim, almost clear inside, arms and legs poke through. Static drawing, no animation of its own.'],
+   ['helmet-listen', 'HELMET LISTEN', 'helmet variant, off by default', 'Same attentive pose and bob as LISTENING, with the dome.']].forEach(([id, title, trig, note]) => {
+    const el = card(id, title, trig, note); hg.appendChild(el);
+    const st = new Stage(el.querySelector('.stage'));
+    stages.push([st, id]);
+  });
+})();
+S['helmet-idle'] = st => { st.reset(); st.chipHide(); st.idle(true); };
+S['helmet-listen'] = st => { st.reset(); st.pose('helmet-listen'); st.input(); };
+function startAll() { stages.forEach(([st, id]) => S[id](st)); }
+startAll();
+
+// ---- real-size chip sample
+(function () {
+  const c = document.getElementById('rs-chip'); const t0 = performance.now();
+  c.innerHTML = '<span class="glyph claude">✻</span><span class="claude">' + esc(EL.verbs[EL.verbs.indexOf('Clauding')]) + '…</span>';
+})();
+
+// ---- controls
+const zoomSel = document.getElementById('zoom');
+// Largest zoom at which the longest chip (about 20 monospace columns next to a 48 pt Clawd) fits
+// the NARROWEST stage on the page. The FLOW card spans the full width, so measuring only the
+// first stage made every other card clip its chip on wide screens.
+function fitZoom() {
+  let w = Infinity;
+  document.querySelectorAll('.stage').forEach(s => { if (s.clientWidth > 0) w = Math.min(w, s.clientWidth); });
+  if (!isFinite(w)) w = 320;
+  return Math.max(1, Math.min(3, Math.floor(((w - 24) / 250) * 4) / 4));
+}
+function applyZoom() {
+  const fit = fitZoom();
+  let z = zoomSel.value === 'auto' ? fit : Math.min(Number(zoomSel.value), fit);
+  const limited = zoomSel.value !== 'auto' && Number(zoomSel.value) > fit;
+  document.documentElement.style.setProperty('--z', z);
+  if (!document.getElementById('status').dataset.fixed) {
+    document.getElementById('status').textContent = limited ? 'Zoom limited to ' + z + 'x so the text chip fits this window.' : '';
+  }
+}
+zoomSel.addEventListener('change', applyZoom);
+window.addEventListener('resize', applyZoom);
+applyZoom();
+const pauseBtn = document.getElementById('pause');
+pauseBtn.addEventListener('click', () => {
+  paused = !paused; pauseBtn.textContent = paused ? 'Play' : 'Pause'; pauseBtn.setAttribute('aria-pressed', String(paused));
+  last = performance.now();
+});
+if (window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches) { paused = true; pauseBtn.textContent = 'Play'; const st = document.getElementById('status'); st.dataset.fixed = '1'; st.textContent = 'Paused (reduced motion is on). Press Play.'; }
+
+// ---- extracted facts table
+(function () {
+  document.getElementById('ver').textContent = '(' + EL.version + ', dark theme)';
+  const sw = c => `<span class="swatch" style="background:${c}"></span>`;
+  const rows = [
+    ['Spinner glyphs (default)', `<code>${GL.join(' ')}</code> <span class="badge">${EL.glyphOffset}</span>`],
+    ['Spinner timing', `animation clock ${EL.clockTickMs} ms (50 ms while requesting); glyph index = round(5 * (1 - cos(2 pi t / ${EL.periodMs})) / 2), so it goes there and back every ${EL.periodMs} ms and dwells at both ends (ping-pong by easing)`],
+    ['Verb shimmer', '3-character window in the shimmer color; sweeps left to right at 50 ms per column while requesting, right to left at 200 ms otherwise'],
+    ['Present-tense verbs', `${EL.verbs.length} (e.g. ${EL.verbs.slice(0, 6).join(', ')}) <span class="badge">${EL.verbsOffset}</span>`],
+    ['Past-tense verbs', `${EL.pastVerbs.length}: ${EL.pastVerbs.join(', ')} <span class="badge">${EL.pastOffset}</span>`],
+    ['Turn-complete line', `<code>${EL.doneGlyph} &lt;past verb&gt; for &lt;duration&gt;</code>, dim; duration like 5s or 1m 12s`],
+    ['Interrupt line', `<code>${esc(EL.respGlyph)} ${esc(EL.interrupt)}</code> (prefix: two spaces, ${EL.respGlyph}, space, NBSP; dim)`],
+    ['Error line', `<code>${EL.respGlyph} Error: &lt;message&gt;</code>, error color (the pet shows <code>Error</code>)`],
+    ['Input box', `round border (top and bottom rules), ${sw(EL.theme.promptBorder)}${EL.theme.promptBorder}, prompt <code>${EL.promptChar}</code> dim`],
+    ['Colors (dark)', `${sw(EL.theme.claude)}claude ${EL.theme.claude}<br>${sw(EL.theme.claudeShimmer)}shimmer ${EL.theme.claudeShimmer}<br>${sw(EL.theme.inactive)}inactive ${EL.theme.inactive}<br>${sw(EL.theme.error)}error ${EL.theme.error}`],
+  ];
+  document.getElementById('facts').innerHTML = rows.map(r => `<tr><th>${r[0]}</th><td>${r[1]}</td></tr>`).join('');
+})();
+</script>
+</body>
+</html>

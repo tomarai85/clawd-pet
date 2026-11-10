@@ -1,0 +1,457 @@
+{
+  "cellPx": 50,
+  "files": {
+    "Clawd-Arcade": {
+      "vertices": 2304,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [45.25, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 1.12,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A34",
+      "origin": [746, 650]
+    },
+    "Clawd-BerryPicking": {
+      "vertices": 7960,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [0.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 0.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A32",
+      "origin": [750, 650]
+    },
+    "Clawd-Blooming": {
+      "vertices": 5700,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [45.25, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 1.13,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A31",
+      "origin": [746, 650]
+    },
+    "Clawd-BreakDancing": {
+      "vertices": 6088,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [45.25, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 1.13,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A10",
+      "origin": [746, 650]
+    },
+    "Clawd-Bubble": {
+      "vertices": 1892,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [34.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 1.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A28",
+      "origin": [736, 650]
+    },
+    "Clawd-Coffee": {
+      "vertices": 568,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [44.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 0.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A19",
+      "origin": [746, 650]
+    },
+    "Clawd-Confetti": {
+      "vertices": 1620,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [44.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 0.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A11",
+      "origin": [746, 650]
+    },
+    "Clawd-ConfettiHappy": {
+      "vertices": 2912,
+      "offGridAtOrigin": 490,
+      "bestFitPhase": [46.0, 2.0],
+      "offGridAtBestFit": 478,
+      "worstDeviationPx": 6.0,
+      "rectanglesLostToSampling": 161,
+      "lostMaxThinSidePx": 4.0,
+      "board": "A11",
+      "origin": [746, 650],
+      "frames": 34,
+      "lostRectanglesVisiblePerFrame": {
+        "max": 50,
+        "mean": 15.24
+      },
+      "ambiguousCellsPerFrame": {
+        "max": 0,
+        "mean": 0.0
+      },
+      "centreVsMajorityFlipsPerFrame": {
+        "max": 0,
+        "mean": 0.0,
+        "framesWithAnyFlip": 0
+      },
+      "worstFrames": [7, 19, 8]
+    },
+    "Clawd-Dancing": {
+      "vertices": 960,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [44.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 0.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A9",
+      "origin": [746, 650]
+    },
+    "Clawd-DancingHappy": {
+      "vertices": 964,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [44.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 0.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A9",
+      "origin": [746, 650]
+    },
+    "Clawd-Desktop": {
+      "vertices": 2464,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [44.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 0.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A21",
+      "origin": [746, 650]
+    },
+    "Clawd-Excited": {
+      "vertices": 440,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [44.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 0.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A8",
+      "origin": [746, 650]
+    },
+    "Clawd-Fishing": {
+      "vertices": 4496,
+      "offGridAtOrigin": 1878,
+      "bestFitPhase": [47.25, 1.25],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 3.12,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A29",
+      "origin": [748, 650],
+      "frames": 109,
+      "lostRectanglesVisiblePerFrame": {
+        "max": 0,
+        "mean": 0.0
+      },
+      "ambiguousCellsPerFrame": {
+        "max": 0,
+        "mean": 0.0
+      },
+      "centreVsMajorityFlipsPerFrame": {
+        "max": 0,
+        "mean": 0.0,
+        "framesWithAnyFlip": 0
+      },
+      "worstFrames": [0, 1, 2]
+    },
+    "Clawd-Headphones": {
+      "vertices": 3020,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [34.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 0.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A18",
+      "origin": [736, 650]
+    },
+    "Clawd-Heart": {
+      "vertices": 992,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [34.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 1.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A12",
+      "origin": [736, 650]
+    },
+    "Clawd-HulaHoop": {
+      "vertices": 3192,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [44.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 0.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A27",
+      "origin": [746, 650]
+    },
+    "Clawd-Juggling": {
+      "vertices": 2924,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [45.25, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 1.13,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A26",
+      "origin": [746, 650],
+      "frames": 54,
+      "lostRectanglesVisiblePerFrame": {
+        "max": 0,
+        "mean": 0.0
+      },
+      "ambiguousCellsPerFrame": {
+        "max": 0,
+        "mean": 0.0
+      },
+      "centreVsMajorityFlipsPerFrame": {
+        "max": 0,
+        "mean": 0.0,
+        "framesWithAnyFlip": 0
+      },
+      "worstFrames": [0, 1, 2]
+    },
+    "Clawd-Jumping": {
+      "vertices": 616,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [34.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 1.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A3",
+      "origin": [736, 650]
+    },
+    "Clawd-JumpingHappy": {
+      "vertices": 784,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [34.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 1.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A3",
+      "origin": [736, 650]
+    },
+    "Clawd-Laptop": {
+      "vertices": 1396,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [34.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 1.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A20",
+      "origin": [736, 650]
+    },
+    "Clawd-Lightbulb": {
+      "vertices": 1196,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [34.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 0.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A14",
+      "origin": [736, 650]
+    },
+    "Clawd-Meditating": {
+      "vertices": 1372,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [44.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 0.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A16",
+      "origin": [746, 650]
+    },
+    "Clawd-Notebook": {
+      "vertices": 1904,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [45.25, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 1.13,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A22",
+      "origin": [746, 650]
+    },
+    "Clawd-Phone": {
+      "vertices": 1116,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [44.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 0.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A23",
+      "origin": [746, 650]
+    },
+    "Clawd-Rainbow": {
+      "vertices": 4168,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [44.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 0.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A13",
+      "origin": [746, 650]
+    },
+    "Clawd-Rose": {
+      "vertices": 1768,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [44.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 0.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A33",
+      "origin": [746, 650]
+    },
+    "Clawd-Snooze": {
+      "vertices": 584,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [34.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 1.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A15",
+      "origin": [736, 650]
+    },
+    "Clawd-Spark": {
+      "vertices": 3480,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [34.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 0.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A25",
+      "origin": [736, 650]
+    },
+    "Clawd-Sunglasses": {
+      "vertices": 1320,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [45.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 0.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A17",
+      "origin": [747, 650]
+    },
+    "Clawd-Swaying": {
+      "vertices": 480,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [44.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 0.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A7",
+      "origin": [746, 650]
+    },
+    "Clawd-Thinking": {
+      "vertices": 848,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [34.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 1.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A1",
+      "origin": [736, 650]
+    },
+    "Clawd-Turning": {
+      "vertices": 368,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [34.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 1.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A6",
+      "origin": [736, 650]
+    },
+    "Clawd-Watch": {
+      "vertices": 1116,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [34.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 0.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A24",
+      "origin": [736, 650]
+    },
+    "Clawd-Watering": {
+      "vertices": 2392,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [45.25, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 1.13,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A30",
+      "origin": [746, 650]
+    },
+    "clawd-looking": {
+      "vertices": 556,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [34.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 0.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A2",
+      "origin": [736, 650]
+    },
+    "clawd-walking": {
+      "vertices": 560,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [34.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 0.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A5",
+      "origin": [736, 650]
+    },
+    "clawd-waving": {
+      "vertices": 536,
+      "offGridAtOrigin": 0,
+      "bestFitPhase": [34.0, 0.0],
+      "offGridAtBestFit": 0,
+      "worstDeviationPx": 1.0,
+      "rectanglesLostToSampling": 0,
+      "lostMaxThinSidePx": 0,
+      "board": "A4",
+      "origin": [736, 650]
+    }
+  }
+}

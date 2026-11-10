@@ -1,0 +1,6 @@
+#!/bin/sh
+# Brings an installed pet up to the current build in place: the agent, the CLI and the art; never the plist or the launcher. Run it after
+# swift build -c release. Restarts the agent only when something it has already read changed. If it is cut short, run it again.
+set -eu
+repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+exec /bin/bash "$repo/bin/clawd-pet" update "$@"

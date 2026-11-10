@@ -1,0 +1,127 @@
+#!/bin/sh
+# PATH shim for the install/uninstall interrupt tests. The test directory holds symlinks to this file named mkdir, cp, mv, chmod,
+# sed, rm and rmdir, and puts that directory first on the PATH of the one CLI process under test. Every call is counted; the call
+# with the chosen number can cut the CLI short exactly there. Without OPSHIM_COUNT it is a transparent pass-through.
+#
+#   OPSHIM_COUNT       file holding the number of calls so far (the test writes 0 first)
+#   OPSHIM_LOG         appended with "<n> <command> <arguments>" for every call
+#   OPSHIM_KILL_AT     the call number to act on (0 = never)
+#   OPSHIM_KILL_MODE   before  SIGKILL the CLI process, then exit without doing the operation
+#                      after   do the operation, then SIGKILL the CLI process
+#                      tear    for cp: leave a one-byte copy with the source's mode, then SIGKILL the CLI process (a copy cut mid-write)
+#                      stop    write this shim's pid to OPSHIM_STOP_PIDFILE and stop itself (SIGSTOP) before the operation; the
+#                              operation runs when the test sends SIGCONT. This is the copy child that outlives the installer.
+#   OPSHIM_PIDFILE     file holding the pid of the CLI process the test started: the only process this shim can ever signal, and
+#                      only when it is this shim's parent. Nothing is looked up by name.
+#   OPSHIM_WAIT_AT     a call number at which the shim BLOCKS until the test releases it (the signal-while-copying test). A handshake,
+#                      not a window: the shim creates the file OPSHIM_WAIT_READY, then waits until the file OPSHIM_WAIT_RELEASE
+#                      exists; the test sends its signal while the shim is blocked and creates the release file afterwards, so the
+#                      signal lands inside the operation however slow the machine is.
+#   OPSHIM_WAIT_MAX    the generous upper bound (seconds, default 120) on that wait. When it is hit the shim logs HANDSHAKE-TIMEOUT to
+#                      OPSHIM_LOG and exits 125 WITHOUT doing the operation, so a missed handshake fails the test and never passes it.
+#   OPSHIM_CORRUPT_AT  a call number whose cp is done and then spoiled: one byte is appended to the destination and the shim exits 0,
+#                      so the copy "succeeded" and is wrong (the install must notice by sha256, not by the exit status)
+#   OPSHIM_HOOK_AT     a call number at which to run the executable OPSHIM_HOOK to completion, OPSHIM_HOOK_WHEN (before|after) the
+#                      operation itself (a second command racing the CLI at a chosen point). The hook runs with OPSHIM_COUNT
+#                      empty, so whatever it calls through this directory is neither counted nor cut.
+# Run through op-shim-trampoline (compiled, see its header), the command name arrives in OPSHIM_NAME; $0 is this script then.
+name=${OPSHIM_NAME:-$(basename "$0")}
+unset OPSHIM_NAME
+case "$name" in
+  mkdir) real=/bin/mkdir ;;
+  cp) real=/bin/cp ;;
+  mv) real=/bin/mv ;;
+  chmod) real=/bin/chmod ;;
+  sed) real=/usr/bin/sed ;;
+  rm) real=/bin/rm ;;
+  rmdir) real=/bin/rmdir ;;
+  *) echo "op-shim: not a shimmed command name: $name" >&2; exit 127 ;;
+esac
+[ -n "${OPSHIM_COUNT:-}" ] || exec "$real" "$@"
+n=$(cat "$OPSHIM_COUNT" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "$OPSHIM_COUNT"
+[ -z "${OPSHIM_LOG:-}" ] || printf '%s %s %s\n' "$n" "$name" "$*" >> "$OPSHIM_LOG"
+
+if [ "${OPSHIM_WAIT_AT:-0}" = "$n" ]; then
+  : > "$OPSHIM_WAIT_READY"
+  waited=0
+  limit=$(( ${OPSHIM_WAIT_MAX:-120} * 50 ))
+  while [ ! -e "$OPSHIM_WAIT_RELEASE" ]; do
+    if [ "$waited" -ge "$limit" ]; then
+      [ -z "${OPSHIM_LOG:-}" ] || echo "op-shim: HANDSHAKE-TIMEOUT at call $n: no release within ${OPSHIM_WAIT_MAX:-120} s; the operation was not done" >> "$OPSHIM_LOG"
+      exit 125
+    fi
+    sleep 0.02
+    waited=$((waited + 1))
+  done
+fi
+
+if [ "${OPSHIM_HOOK_AT:-0}" = "$n" ]; then
+  case "${OPSHIM_HOOK_WHEN:-before}" in
+    before) OPSHIM_COUNT= "$OPSHIM_HOOK" ;;
+    after)
+      "$real" "$@"
+      status=$?
+      OPSHIM_COUNT= "$OPSHIM_HOOK"
+      exit "$status" ;;
+  esac
+fi
+
+if [ "${OPSHIM_CORRUPT_AT:-0}" = "$n" ]; then
+  "$real" "$@"
+  status=$?
+  if [ "$name" = cp ] && [ "$status" -eq 0 ]; then
+    src=""; dst=""
+    for a in "$@"; do
+      [ "$a" != -- ] || continue
+      [ -n "$src" ] || src="$a"; dst="$a"
+    done
+    # `cp -- a b c dir/` (a directory's worth of art files): the copy that is spoiled is the first of them.
+    [ ! -d "$dst" ] || dst="$dst/$(basename "$src")"
+    printf 'X' >> "$dst"
+  fi
+  exit "$status"
+fi
+
+if [ "${OPSHIM_KILL_AT:-0}" = "$n" ]; then
+  victim=$(cat "${OPSHIM_PIDFILE:-/nonexistent}" 2>/dev/null)
+  case "$victim" in
+    ''|*[!0-9]*)
+      [ -z "${OPSHIM_LOG:-}" ] || echo "op-shim: no victim pid for call $n; nothing signalled" >> "$OPSHIM_LOG"
+      exec "$real" "$@" ;;
+  esac
+  if [ "$victim" != "$PPID" ]; then
+    [ -z "${OPSHIM_LOG:-}" ] || echo "op-shim: call $n is not a direct child of $victim; nothing signalled" >> "$OPSHIM_LOG"
+    exec "$real" "$@"
+  fi
+  case "${OPSHIM_KILL_MODE:-before}" in
+    before)
+      kill -KILL "$victim"
+      exit 137 ;;
+    after)
+      "$real" "$@"
+      status=$?
+      kill -KILL "$victim"
+      exit "$status" ;;
+    tear)
+      if [ "$name" = cp ]; then
+        src=""; dst=""
+        for a in "$@"; do
+          [ "$a" != -- ] || continue
+          [ -n "$src" ] || src="$a"; dst="$a"
+        done
+        # `cp -- a b c dir/` (a directory's worth of art files): the copy cut mid-write is the first of them.
+        [ ! -d "$dst" ] || dst="$dst/$(basename "$src")"
+        head -c 1 "$src" > "$dst"
+        /bin/chmod "$(/usr/bin/stat -f %Lp "$src")" "$dst"
+      fi
+      kill -KILL "$victim"
+      exit 137 ;;
+    stop)
+      echo $$ > "$OPSHIM_STOP_PIDFILE"
+      kill -STOP $$
+      exec "$real" "$@" ;;
+  esac
+fi
+exec "$real" "$@"

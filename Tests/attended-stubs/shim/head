@@ -1,0 +1,11 @@
+#!/bin/bash
+# `head` for the attended-check tests that put a rotation of agent.log INSIDE the script's analysis (this directory goes first in PATH).
+# It is the real head. After the one call of the form `head -c N` that reads standard input (the analysis's read of the window's INPUT
+# bytes, which comes after the first reads of agent.log and before the read of its FOCUS_VIOLATION lines) it runs the shell command in
+# $STUB_DIR/head.hook, once. Without that file it is the real head and nothing else.
+/usr/bin/head "$@"; rc=$?
+if [ "${1:-}" = -c ] && [ "$#" -eq 2 ] && [ -f "$STUB_DIR/head.hook" ] && [ ! -e "$STUB_DIR/head.hook.fired" ]; then
+  : > "$STUB_DIR/head.hook.fired"
+  /bin/bash "$STUB_DIR/head.hook"
+fi
+exit "$rc"

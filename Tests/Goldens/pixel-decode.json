@@ -1,0 +1,29 @@
+{
+  "canaries" : [
+    {
+      "decoded_sha256" : "9b0feed02f4ca5ca0c16fde2fb1a5f07a85a5c9199f9e1805cb904a13811115c",
+      "file" : "art-untagged-opaque.png"
+    },
+    {
+      "decoded_sha256" : "9fd7deb5c81e4ad604932206326dacb1927e20a63757b1a58cbe5e700cb9df7e",
+      "file" : "art-untagged-partial-alpha.png"
+    },
+    {
+      "decoded_sha256" : "2f0ca5730e294b5f074dc68e93b02e29e4f59248d25a9f72434c338d1472d1b0",
+      "file" : "art-srgb-tagged.png"
+    },
+    {
+      "decoded_sha256" : "41e85ef972d193558f12fdd6501c270fc91a2d2faa1859501298bc7c66ae8094",
+      "file" : "art-exif-phys-ztxt.png"
+    },
+    {
+      "decoded_sha256" : "5d6064049e0b2be96c7f98867b8af647556e090478a16ef3362413da4a1bccc9",
+      "file" : "golden-srgb-exif-partial-alpha.png"
+    },
+    {
+      "decoded_sha256" : "8a6b144e20bc9256c8833d3e639ee3f8bafe93d173b432067d35efdbbe573511",
+      "file" : "golden-srgb-exif-opaque.png"
+    }
+  ],
+  "sw_vers" : "ProductName:\t\tmacOS\nProductVersion:\t\t26.6.2\nBuildVersion:\t\t25G83\n"
+}

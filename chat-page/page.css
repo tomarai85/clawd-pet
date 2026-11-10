@@ -1,0 +1,292 @@
+/* Clawd chat page: Orca "Native Chat" (MIT, orca-upstream @ a7c8c3baefd), resolved from Tailwind classes to plain CSS. Paths below are
+   relative to orca-upstream/src/renderer/src/ ("C/" = components/native-chat/). Where a value is derived the comment says how. The composer
+   is not on this page: it is Clawd's native input under the web view (see ChatWebBody.swift). */
+
+/* ---- Fonts: assets/main.css:11-17 (Geist variable woff2 bundled by Orca, SIL OFL 1.1) ---- */
+@font-face {
+  font-family: 'Geist';
+  src: url('Geist-Variable.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ---- Tokens, light: assets/main.css:149-204 (:root) ---- */
+:root {
+  --app-font-family: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; /* main.css:150 */
+  --font-mono: 'SF Mono', SFMono-Regular, ui-monospace, 'Cascadia Code', Menlo, Consolas, 'Liberation Mono', monospace; /* main.css:152-153 */
+  --radius: 0.625rem; /* main.css:155 */
+  --radius-sm: calc(var(--radius) * 0.6); /* main.css:138 */
+  --radius-md: calc(var(--radius) * 0.8); /* main.css:139 */
+  --radius-lg: var(--radius); /* main.css:140 */
+  --radius-xl: calc(var(--radius) * 1.4); /* main.css:141 */
+  --background: #fff; /* main.css:173 */
+  --foreground: #0a0a0a; /* main.css:175 */
+  --muted-foreground: #737373; /* main.css:199 */
+  --primary: #171717; /* main.css:194 */
+  --primary-foreground: #fafafa; /* main.css:195 */
+  --accent: #f5f5f5; /* main.css:200 */
+  --accent-foreground: #171717; /* main.css:201 */
+  --status-success: #15803d; /* main.css:215 */
+  --card: #fff; /* main.css:190 */
+  --secondary: #f5f5f5; /* main.css:196 */
+  --destructive: #e40014; /* main.css:202 */
+  --border: #e5e5e5; /* main.css:204 */
+  --chat-canvas: var(--background); /* main.css:176 */
+  --chat-foreground: color-mix(in srgb, var(--foreground) 82%, var(--chat-canvas)); /* :177 */
+  --chat-foreground-strong: color-mix(in srgb, var(--foreground) 92%, var(--chat-canvas)); /* :178 */
+  --chat-foreground-faint: var(--muted-foreground); /* :179 */
+  --chat-user-surface: color-mix(in srgb, var(--foreground) 4%, var(--chat-canvas)); /* :180 */
+  --chat-user-border: color-mix(in srgb, var(--foreground) 7%, transparent); /* :181 */
+  --chat-code-foreground: color-mix(in srgb, var(--foreground) 85%, var(--chat-canvas)); /* :182 */
+  --chat-code-surface: color-mix(in srgb, var(--foreground) 2%, var(--chat-canvas)); /* :183 */
+  --chat-code-border: color-mix(in srgb, var(--foreground) 7%, transparent); /* :184 */
+  --chat-inline-code-surface: color-mix(in srgb, var(--foreground) 4%, var(--chat-canvas)); /* :185 */
+  --chat-inline-code-border: color-mix(in srgb, var(--foreground) 9%, transparent); /* :186 */
+  --chat-composer-surface: var(--chat-canvas); /* :187 */
+  --chat-composer-border: color-mix(in srgb, var(--foreground) 11%, transparent); /* :188 */
+  --chat-content-max-width: 46rem; /* :189 */
+  /* C/native-chat-appearance-style.ts:48-51 defaults: font 14px, code 12px, ratio 12/14 em */
+  --chat-font-size: 14px;
+  --chat-code-font-size: 12px;
+  --chat-inline-code-ratio: 0.8571428571em;
+  /* Tailwind v4 shadow-xs, used by the composer box */
+  --shadow-xs: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+  color-scheme: light;
+}
+
+/* ---- Tokens, dark: assets/main.css:292-341 (.dark). Same block twice: OS dark, and forced .dark ---- */
+@media (prefers-color-scheme: dark) {
+  :root:not(.light) {
+    --background: #0a0a0a; /* main.css:312 */
+    --foreground: #fafafa; /* main.css:314 */
+    --muted-foreground: #a1a1a1; /* main.css:336 */
+    --primary: #e5e5e5; /* main.css:331 */
+    --primary-foreground: #171717; /* main.css:332 */
+    --accent: #404040; /* main.css:337 */
+    --accent-foreground: #fafafa; /* main.css:338 */
+    --status-success: #86efac; /* main.css:348 */
+    --card: #171717; /* main.css:327 */
+    --secondary: #262626; /* main.css:333 */
+    --destructive: #ff6568; /* main.css:339 */
+    --border: rgb(255 255 255 / 0.07); /* main.css:341 */
+    --chat-canvas: color-mix(in srgb, var(--foreground) 5%, var(--background)); /* :313 */
+    --chat-foreground: color-mix(in srgb, var(--foreground) 78%, var(--chat-canvas)); /* :314 */
+    --chat-foreground-strong: color-mix(in srgb, var(--foreground) 90%, var(--chat-canvas)); /* :315 */
+    --chat-foreground-faint: color-mix(in srgb, var(--muted-foreground) 83%, var(--chat-canvas)); /* :316 */
+    --chat-user-surface: color-mix(in srgb, var(--foreground) 7%, var(--chat-canvas)); /* :317 */
+    --chat-user-border: color-mix(in srgb, var(--foreground) 6%, transparent); /* :318 */
+    --chat-code-foreground: color-mix(in srgb, var(--foreground) 85%, var(--chat-canvas)); /* :319 */
+    --chat-code-surface: color-mix(in srgb, var(--foreground) 3.5%, transparent); /* :320 */
+    --chat-code-border: color-mix(in srgb, var(--foreground) 7%, transparent); /* :321 */
+    --chat-inline-code-surface: color-mix(in srgb, var(--foreground) 6%, transparent); /* :322 */
+    --chat-inline-code-border: color-mix(in srgb, var(--foreground) 8%, transparent); /* :323 */
+    --chat-composer-surface: color-mix(in srgb, var(--foreground) 4%, transparent); /* :324 */
+    --chat-composer-border: color-mix(in srgb, var(--foreground) 9%, transparent); /* :325 */
+    color-scheme: dark;
+  }
+}
+:root.dark {
+  --background: #0a0a0a;
+  --foreground: #fafafa;
+  --muted-foreground: #a1a1a1;
+  --primary: #e5e5e5;
+  --primary-foreground: #171717;
+  --accent: #404040;
+  --accent-foreground: #fafafa;
+  --status-success: #86efac;
+  --card: #171717;
+  --secondary: #262626;
+  --destructive: #ff6568;
+  --border: rgb(255 255 255 / 0.07);
+  --chat-canvas: color-mix(in srgb, var(--foreground) 5%, var(--background));
+  --chat-foreground: color-mix(in srgb, var(--foreground) 78%, var(--chat-canvas));
+  --chat-foreground-strong: color-mix(in srgb, var(--foreground) 90%, var(--chat-canvas));
+  --chat-foreground-faint: color-mix(in srgb, var(--muted-foreground) 83%, var(--chat-canvas));
+  --chat-user-surface: color-mix(in srgb, var(--foreground) 7%, var(--chat-canvas));
+  --chat-user-border: color-mix(in srgb, var(--foreground) 6%, transparent);
+  --chat-code-foreground: color-mix(in srgb, var(--foreground) 85%, var(--chat-canvas));
+  --chat-code-surface: color-mix(in srgb, var(--foreground) 3.5%, transparent);
+  --chat-code-border: color-mix(in srgb, var(--foreground) 7%, transparent);
+  --chat-inline-code-surface: color-mix(in srgb, var(--foreground) 6%, transparent);
+  --chat-inline-code-border: color-mix(in srgb, var(--foreground) 8%, transparent);
+  --chat-composer-surface: color-mix(in srgb, var(--foreground) 4%, transparent);
+  --chat-composer-border: color-mix(in srgb, var(--foreground) 9%, transparent);
+  color-scheme: dark;
+}
+
+/* ---- Minimal Tailwind v4 preflight (what the utilities in Orca assume) ---- */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; border: 0 solid var(--border); } /* main.css:533-537 (border-border) */
+html { line-height: 1.5; -webkit-text-size-adjust: 100%; }
+button { font: inherit; color: inherit; background: transparent; cursor: pointer; text-align: inherit; }
+ul { list-style: none; }
+pre, code { font-family: var(--font-mono); font-size: 1em; }
+svg { display: block; flex-shrink: 0; }
+
+/* main.css:539-557 body: font, 0.01em tracking, antialiasing, no page scroll */
+html, body { height: 100%; }
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--app-font-family);
+  letter-spacing: 0.01em;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+.icon { stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; } /* lucide defaults */
+
+/* ---- Root: C/native-chat-appearance-style.ts:6 (bg-chat-canvas), C/NativeChatStructuredSession.tsx:264-270 (flex h-full flex-col) ---- */
+.native-chat-appearance { display: flex; flex-direction: column; height: 100%; min-height: 0; width: 100%; background: var(--chat-canvas); }
+/* C/NativeChatMessageList.tsx:368-369 */
+.pane { position: relative; display: flex; flex: 1 1 0; flex-direction: column; min-height: 0; background: var(--chat-canvas); }
+.scroller-wrap { position: relative; flex: 1 1 0; min-height: 0; }
+/* C/NativeChatMessageList.tsx:378 (scrollbar-sleek, stable gutter) + assets/main.css:586-606 */
+.scroller { position: relative; height: 100%; overflow-y: auto; overflow-anchor: none; scrollbar-gutter: stable both-edges; scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--muted-foreground) 34%, transparent) transparent; }
+.scroller::-webkit-scrollbar { width: 12px; height: 12px; }
+.scroller::-webkit-scrollbar-track { background: transparent; }
+.scroller::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--muted-foreground) 28%, transparent); border: 3px solid transparent; border-radius: 0; background-clip: padding-box; min-height: 28px; }
+/* C/native-chat-appearance-style.ts:7 (px-3 pt-10 pb-4 sm:px-4) */
+.transcript-outer { padding: 40px 12px 16px; }
+@media (min-width: 640px) { .transcript-outer { padding-left: 16px; padding-right: 16px; } }
+/* C/native-chat-appearance-style.ts:8 (mx-auto flex w-full max-w-46rem flex-col gap-5 px-[5px]) */
+.transcript-column { margin: 0 auto; display: flex; flex-direction: column; width: 100%; max-width: var(--chat-content-max-width); gap: 20px; padding: 0 5px; }
+/* C/NativeChatTranscriptRow.tsx:95 (flex flex-col gap-5) */
+.row { display: flex; flex-direction: column; gap: 20px; }
+
+/* C/native-chat-appearance.css:7-9 */
+.native-chat-message-text { font-size: var(--chat-font-size, 14px); }
+.text-sm { font-size: 0.875rem; line-height: 1.4285714; } /* Tailwind text-sm */
+
+/* ---- User message: C/NativeChatMessageRow.tsx:189 (group flex flex-col items-end gap-0.5) ---- */
+.user-row { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; position: relative; }
+/* C/NativeChatMessageRow.tsx:191 */
+.user-bubble { max-width: 80%; border-radius: var(--radius-xl); border: 1px solid var(--chat-user-border); background: var(--chat-user-surface); padding: 10px 14px; color: var(--chat-foreground-strong); }
+/* C/NativeChatMessageRow.tsx:10-12,39-70: copy + time row is opacity-0 on hover devices but still takes its height (size-6 copy button). While the message
+   is sending, "Sending…" stays visible and the copy button keeps its own reveal. */
+.msg-images { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.msg-image { display: flex; max-width: 100%; align-items: center; gap: 6px; border-radius: var(--radius-md); border: 1px solid var(--border); background: var(--chat-canvas); padding: 4px 8px; font-size: 0.75rem; line-height: 1.3333; color: var(--muted-foreground); }
+.msg-image .icon { width: 14px; height: 14px; flex: none; }
+.msg-image-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.user-meta { display: flex; align-items: center; gap: 4px; height: 24px; user-select: none; }
+.user-meta:not(.sending), .user-meta.sending .copy-btn { opacity: 0; pointer-events: none; transition: opacity 0.15s; }
+.user-row:hover .user-meta:not(.sending), .user-row:focus-within .user-meta:not(.sending),
+.user-row:hover .user-meta.sending .copy-btn, .user-row:focus-within .user-meta.sending .copy-btn { opacity: 1; pointer-events: auto; }
+/* C/NativeChatMessageTimestamp.tsx:48 (rounded-md text-xs whitespace-nowrap faint tabular-nums) and the "Sending…" label (MessageRow:61) */
+.msg-time, .sending-label { border-radius: var(--radius-md); font-size: 0.75rem; line-height: 1.3333; white-space: nowrap; color: var(--chat-foreground-faint); font-variant-numeric: tabular-nums; }
+.msg-time:focus-visible { outline: 2px solid color-mix(in srgb, var(--muted-foreground) 50%, transparent); outline-offset: 0; }
+
+/* ---- Markdown (document variant): sidebar/comment-markdown-element-renderers.tsx:242-300, C/native-chat-markdown.css ---- */
+.native-chat-markdown p { margin: 8px 0; } /* renderers:247 my-2 */
+.native-chat-markdown p:first-child { margin-top: 0; }
+.native-chat-markdown p:last-child { margin-bottom: 0; }
+.native-chat-markdown ul { margin: 8px 0; margin-left: 20px; list-style: disc; } /* renderers:287 my-2 ml-5 list-disc space-y-1 */
+.native-chat-markdown ul > li:not(:last-child) { margin-bottom: 4px; }
+.native-chat-markdown li { line-height: 1.625; } /* renderers:293 leading-relaxed */
+.native-chat-markdown :is(h1, h2, h3, h4, h5, h6, strong) { color: var(--chat-foreground-strong); } /* native-chat-markdown.css:2-4 */
+.native-chat-markdown strong { font-weight: bolder; } /* Tailwind preflight: b, strong { font-weight: bolder } */
+/* native-chat-markdown.css:25-32 (overrides renderers:269 code classes); font-family from renderers font-mono */
+.native-chat-markdown code { border: 1px solid var(--chat-inline-code-border); border-radius: var(--radius-sm); background: var(--chat-inline-code-surface); padding: 1px 5px; color: var(--chat-code-foreground); font-size: var(--chat-inline-code-ratio, 0.8571428571em); overflow-wrap: anywhere; }
+
+/* ---- Fenced code block: C/NativeChatCodeBlock.tsx:18 (my-3 rounded-lg border bg overflow-hidden) ---- */
+.code-block { position: relative; margin: 12px 0; min-width: 0; max-width: 100%; overflow: hidden; border-radius: var(--radius-lg); border: 1px solid var(--chat-code-border); background: var(--chat-code-surface); }
+.code-head { display: flex; height: 30px; align-items: center; justify-content: space-between; padding: 0 12px; } /* :20 h-7.5 px-3 */
+.code-lang { min-width: 0; font-family: var(--app-font-family); font-size: 0.75rem; line-height: 1.3333; color: var(--chat-foreground-faint); } /* :23 */
+/* C/NativeChatCopyButton.tsx:61 (size-6 rounded-md, faint) + :66 size-3.5 icon; -mr-1 at CodeBlock:31 */
+.copy-btn { display: flex; flex-shrink: 0; width: 24px; height: 24px; align-items: center; justify-content: center; border: 0; padding: 0; background: transparent; border-radius: var(--radius-md); color: var(--chat-foreground-faint); font: inherit; cursor: default; transition: color 0.15s, background-color 0.15s; }
+.copy-btn[hidden] { display: none; }
+.copy-btn:hover { background: var(--accent); color: var(--accent-foreground); }
+.copy-btn:focus-visible { outline: 2px solid color-mix(in srgb, var(--muted-foreground) 50%, transparent); outline-offset: 0; }
+.copy-btn.copied { color: var(--status-success); }
+.copy-btn .icon { width: 14px; height: 14px; }
+.code-block pre { margin: 0; max-width: 100%; max-height: 20rem; overflow-x: auto; font-family: var(--font-mono); font-size: var(--chat-code-font-size, 12px); color: var(--chat-code-foreground); padding: 12px 40px 12px 12px; } /* :39-40 (p-3 pr-10 without a language) + native-chat-appearance.css:2-5 */
+.code-block pre.with-head { padding: 2px 14px 12px; } /* :41 (px-3.5 pt-0.5 pb-3 with a language) */
+.code-head .copy-btn { margin-right: -4px; } /* :31 -mr-1 */
+/* :44-50: a fence without a language has its copy button 8 pt from the top and right, shown on hover or keyboard focus on hover devices */
+.copy-btn.code-float { position: absolute; right: 8px; top: 8px; transition: opacity 0.15s, color 0.15s, background-color 0.15s; }
+@media (hover: hover) {
+  .copy-btn.code-float { opacity: 0; pointer-events: none; }
+  .code-block:hover .copy-btn.code-float, .code-block:has(:focus-visible) .copy-btn.code-float { opacity: 1; pointer-events: auto; }
+}
+.code-block pre code { border: none; border-radius: 0; background: transparent; padding: 0; color: inherit; font-size: inherit; } /* native-chat-markdown.css:41-47 */
+
+/* ---- Assistant message row: C/NativeChatMessageRow.tsx:260 ---- */
+.assistant-row { position: relative; max-width: 100%; user-select: text; font-size: 0.875rem; line-height: 1.625; color: var(--chat-foreground); }
+/* C/NativeChatMessageRow.tsx:302-311: hover-only controls (mt-1, h-6, -mb-5) keep 8px of layout */
+.agent-controls[hidden] { display: none; }
+.agent-controls { display: flex; align-items: center; gap: 4px; margin-top: 4px; width: fit-content; height: 24px; margin-bottom: -20px; opacity: 0; pointer-events: none; user-select: none; -webkit-user-select: none; transition: opacity 0.15s; }
+.assistant-row:hover .agent-controls, .assistant-row:focus-within .agent-controls { opacity: 1; pointer-events: auto; }
+
+/* ---- Tool run: C/NativeChatToolRun.tsx:242 (mt-3) ---- */
+.tool-run { margin-top: 12px; }
+/* :260 header button */
+.run-head { display: flex; width: 100%; min-height: 24px; align-items: center; gap: 6px; border-radius: var(--radius-md); padding: 2px 0; text-align: left; }
+/* C/NativeChatToolIcon.tsx:45-46: 16px slot, 14px glyph; ToolRun:268 faint */
+.glyph { display: flex; width: 16px; height: 16px; align-items: center; justify-content: center; color: var(--chat-foreground-faint); }
+.glyph svg { width: 14px; height: 14px; }
+/* ToolRun:276-281 sentence. settled = faint; live = chat-foreground + pulse + max-w 72% */
+.run-sentence { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--chat-font-size, 14px); line-height: 1.625; transition: color .15s; min-width: 0; color: var(--chat-foreground-faint); }
+.run-sentence.live { max-width: 72%; flex-shrink: 0; color: var(--chat-foreground); animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+@keyframes pulse { 50% { opacity: 0.5; } } /* Tailwind animate-pulse */
+.run-check { width: 12px; height: 12px; color: var(--chat-foreground-faint); } /* ToolRun:293 */
+/* ToolRun:297-303 latest-call label; command chip = NativeChatToolLine.tsx:121 */
+.run-latest { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--app-font-family); font-size: 0.75rem; line-height: 1.3333; color: var(--chat-foreground-faint); }
+.chip { border-radius: var(--radius-md); border: 1px solid var(--chat-inline-code-border); background: var(--chat-inline-code-surface); padding: 0 6px; font-family: var(--font-mono); font-size: 0.75rem; line-height: 1.3333; color: var(--chat-foreground); }
+/* ToolRun:310-314 chevron (size-3.5, opacity-0 until hover; rotate-90 + visible when open) */
+.chev { width: 14px; height: 14px; color: var(--chat-foreground-faint); opacity: 0; }
+.chev.open { opacity: 1; transform: rotate(90deg); }
+/* ToolRun:321 members rail */
+.run-body { margin-left: 7px; margin-top: 2px; border-left: 1px solid var(--chat-code-border); padding-left: 13px; }
+/* C/NativeChatToolLine.tsx:89 */
+.tool-line { display: flex; min-height: 26px; width: 100%; align-items: center; gap: 8px; font-family: var(--app-font-family); font-size: 13px; line-height: 1.5; }
+.tool-line .verb { flex-shrink: 0; color: var(--chat-foreground-faint); } /* :109-110 */
+.tool-line .target { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--chat-foreground); } /* :119 */
+.tool-line .chip { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } /* :119-121 */
+/* C/NativeChatToolAnnotations.tsx:44 (exit code / duration, right aligned) */
+.tool-meta { margin-left: auto; display: flex; flex-shrink: 0; gap: 6px; font-size: 0.75rem; line-height: 1.3333; font-variant-numeric: tabular-nums; color: var(--chat-foreground-faint); }
+
+/* ---- Turn bar under the user message: C/NativeChatWorkingStatus.tsx:72 ---- */
+.separator { display: flex; align-items: center; gap: 12px; padding: 8px 0; font-size: 0.75rem; line-height: 1.3333; color: var(--muted-foreground); }
+.separator .rule { height: 1px; flex: 1 1 0%; background: var(--border); }
+.turn-bar { display: flex; min-height: 32px; align-items: center; gap: 4px; border-bottom: 1px solid var(--border); font-size: 0.875rem; line-height: 1.4285714; color: var(--chat-foreground-faint); font-variant-numeric: tabular-nums; }
+
+/* ---- Live tail line: C/NativeChatTurnActivityLine.tsx:26,31,32 ---- */
+.activity { display: flex; min-height: 24px; align-items: center; gap: 6px; font-size: var(--chat-font-size, 14px); line-height: 1.625; color: var(--muted-foreground); }
+.activity .spin { width: 16px; height: 16px; animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.activity .label { min-width: 0; flex: 1 1 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: color-mix(in oklab, var(--foreground) 85%, transparent); } /* text-foreground/85 */
+
+/* Snapshot determinism: a snapshot tool adds .freeze, so the spinner/pulse sit at their first frame.
+   Orca does the same for reduced motion (motion-reduce:animate-none, ToolRun:279, ActivityLine:31). */
+html.freeze *, html.freeze *::before { animation: none !important; }
+@media (prefers-reduced-motion: reduce) { .run-sentence.live, .activity .spin { animation: none; } }
+.tail { display: flex; flex-direction: column; gap: 20px; }
+.tail[hidden] { display: none; }
+.activity .spin.still { animation: none; }
+.native-chat-markdown.plain { white-space: pre-wrap; font-family: -apple-system, BlinkMacSystemFont, sans-serif; overflow-wrap: break-word; letter-spacing: normal; text-rendering: optimizeSpeed; } /* plain fallback of a reply with a huge element tree: cheap to lay out; the system font because a 256 KiB run in the web font (Geist) took 47 s to lay out */
+
+/* ---- "Jump to latest": C/NativeChatMessageList.tsx:418-428 (absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-full border bg-card/90
+   px-3 py-1.5 text-xs text-muted-foreground shadow-sm backdrop-blur) ---- */
+.jump { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 6px; border-radius: 9999px; border: 1px solid var(--border); background: color-mix(in srgb, var(--card) 90%, transparent); -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); padding: 6px 12px; font-size: 0.75rem; line-height: 1.3333; color: var(--muted-foreground); box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05); white-space: nowrap; cursor: default; }
+.jump[hidden] { display: none; }
+.jump .icon { width: 14px; height: 14px; }
+.jump:hover { background: var(--accent); color: var(--accent-foreground); }
+.jump:focus-visible { outline: 2px solid color-mix(in srgb, var(--muted-foreground) 50%, transparent); outline-offset: 0; }
+
+/* ---- Link popover: LA/LinkActionPopover.tsx:124-210 inside ui/popover.tsx:171-175 (rounded-md, 14% border, 82% white or 72% black surface, 2xl blur,
+   dual shadow); w-max min-w-52 max-w-[min(21rem,calc(100vw-1rem))] p-1 ---- */
+.link-popover { position: fixed; z-index: 60; width: max-content; min-width: 208px; padding: 4px; overflow: hidden; border-radius: var(--radius-md); border: 1px solid rgb(0 0 0 / 0.14); background: rgb(255 255 255 / 0.82); color: var(--foreground); -webkit-backdrop-filter: blur(40px); backdrop-filter: blur(40px); box-shadow: 0 16px 36px rgb(0 0 0 / 0.24), inset 0 1px 0 rgb(255 255 255 / 0.14); outline: none; }
+@media (prefers-color-scheme: dark) { :root:not(.light) .link-popover { border-color: rgb(255 255 255 / 0.14); background: rgb(0 0 0 / 0.72); box-shadow: 0 20px 44px rgb(0 0 0 / 0.42), inset 0 1px 0 rgb(255 255 255 / 0.04); } }
+:root.dark .link-popover { border-color: rgb(255 255 255 / 0.14); background: rgb(0 0 0 / 0.72); box-shadow: 0 20px 44px rgb(0 0 0 / 0.42), inset 0 1px 0 rgb(255 255 255 / 0.04); }
+/* :147 mb-0.5 flex items-center gap-1 overflow-hidden border-b px-1.5 py-0.5 font-mono text-xs text-muted-foreground */
+.lp-head { display: flex; align-items: center; gap: 4px; margin-bottom: 2px; overflow: hidden; border-bottom: 1px solid var(--border); padding: 2px 6px; font-family: var(--font-mono); font-size: 0.75rem; line-height: 1.3333; color: var(--muted-foreground); }
+.lp-url { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; min-width: 0; flex: 1 1 0; overflow: hidden; word-break: break-all; } /* line-clamp-2 break-all */
+.lp-head .copy-btn { color: var(--muted-foreground); }
+/* :43-45 ActionRow: h-8 w-full justify-start gap-1.5 px-1.5 text-[13px] ghost button */
+.lp-row { display: flex; width: 100%; height: 32px; align-items: center; justify-content: flex-start; gap: 6px; padding: 0 6px; border-radius: var(--radius-md); font-size: 13px; line-height: 1.5; color: var(--foreground); cursor: default; }
+.lp-row:hover { background: var(--accent); color: var(--accent-foreground); }
+.lp-row:focus-visible { outline: 2px solid color-mix(in srgb, var(--muted-foreground) 50%, transparent); outline-offset: 0; }
+.lp-row .icon { width: 14px; height: 14px; }
+.lp-label { min-width: 0; flex: 1 1 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
+.lp-keys { display: inline-flex; align-items: center; gap: 4px; }
+/* ShortcutKeyCombo.tsx:6-12 KeyCap with keyCapClassName "min-w-5 px-1 py-0 text-[11px]" */
+.keycap { display: inline-flex; min-width: 20px; align-items: center; justify-content: center; border-radius: 4px; border: 1px solid color-mix(in srgb, var(--border) 80%, transparent); background: color-mix(in srgb, var(--secondary) 70%, transparent); padding: 0 4px; font-size: 11px; line-height: 1.4545; font-weight: 500; color: var(--muted-foreground); box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05); }

@@ -1,0 +1,12 @@
+#!/bin/sh
+# Explicit opt-in live measurement. No window or audio IO; never called by install or tests.
+set -eu
+repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+seconds=${1:-300}
+key_path=${2:-nativeMicrophone.id}
+identity="com.tomtim.clawd-pet.probe.$(date +%s).$$"
+probe_dir="$repo/.evidence/probes/$identity"
+mkdir -p "$probe_dir"
+cp "$repo/.build/release/clawd-release-probe" "$probe_dir/$identity"
+/usr/bin/codesign --force --sign - --identifier "$identity" "$probe_dir/$identity"
+exec "$probe_dir/$identity" --output "$repo/probe/probe-release.json" --fresh-identity "$identity" --seconds "$seconds" --input-key-path "$key_path"

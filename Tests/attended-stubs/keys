@@ -1,0 +1,71 @@
+#!/bin/bash
+# Stub of what the user types in the terminal, for the menu check's tests (the seam CLAWD_ATTENDED_KEYS). It prints lines on stdout until it is
+# told to stop (TERM), the process that reads it goes away, or the check's samples stop (no new sample for 3 s). Its clock is the check's own
+# samples.txt (the synthetic clock of the stub sampler), in $CLAWD_ATTENDED_WORK, so the order of events never depends on how fast the test
+# machine runs. Two sources:
+#   $STUB_DIR/keys.queue   lines "<due ms> LINE", written by the sampler stub's `key MS LINE` action: LINE is printed once the clock reaches
+#                          the due time. `WORD:N` in LINE is replaced by the word of prompt N (from the check's prompts.txt); a line that
+#                          names a prompt that does not exist yet waits for it.
+#   $STUB_DIR/keys.react   lines "prompt:N DELAY_MS LINE": LINE is printed when the clock reaches the stamp the check recorded for prompt N
+#                          plus DELAY_MS (typing time plus the reader's lag), with `WORD:N` replaced as above.
+# $STUB_DIR/keys.hold (a file) turns the stale-samples exit off: like the real reader on the terminal, the stub then ends only on TERM or
+# when its parent goes, so a run that never stops its reader leaves it running (the interrupt scenarios of the menu check). With it the
+# stub also writes its parent's pid (the reader job the check started) to keys.parent and its own to keys.pid, so a test names the job.
+work="${CLAWD_ATTENDED_WORK:-}"
+[ -n "$work" ] || { echo "stub keys: no work directory" >&2; exit 2; }
+samples="$work/samples.txt"; prompts="$work/prompts.txt"
+queue="$STUB_DIR/keys.queue"; react="$STUB_DIR/keys.react"
+queued=(); reacted=()
+parent="$PPID"
+if [ -f "$STUB_DIR/keys.hold" ]; then echo "$parent" > "$STUB_DIR/keys.parent"; echo "$$" > "$STUB_DIR/keys.pid"; fi
+stale=0; lastsize=-1
+now() { tail -n 2 "$samples" 2>/dev/null | sed -n 1p | cut -d' ' -f1; }
+word_of() { awk -v n="$1" '$1 == "PROMPT" && $2 == n { print $3; exit }' "$prompts" 2>/dev/null; }
+sigma_of() { awk -v n="$1" '$1 == "PROMPT" && $2 == n { for (i = 4; i <= NF; i++) if ($i ~ /^sigma=/) print substr($i, 7); exit }' "$prompts" 2>/dev/null; }
+# fill WORD:N in a line; returns 1 when the prompt does not exist yet
+fill() {
+  local line="$1" n word
+  while :; do
+    case "$line" in
+      *WORD:[0-9]*)
+        n="${line#*WORD:}"; n="${n%%[!0-9]*}"
+        word="$(word_of "$n")"; [ -n "$word" ] || return 1
+        line="${line/WORD:$n/$word}" ;;
+      *) break ;;
+    esac
+  done
+  printf '%s\n' "$line"
+}
+trap 'exit 0' TERM INT
+while kill -0 "$parent" 2>/dev/null; do
+  size="$(wc -c < "$samples" 2>/dev/null | tr -d ' ')"
+  if [ "$size" = "$lastsize" ]; then stale=$((stale + 1)); else stale=0; lastsize="$size"; fi
+  [ "$stale" -lt 60 ] || [ -f "$STUB_DIR/keys.hold" ] || exit 0
+  clock="$(now)"
+  if [ -n "$clock" ]; then
+    if [ -f "$queue" ]; then
+      i=0
+      while IFS= read -r entry; do
+        i=$((i + 1))
+        [ "${queued[$i]:-0}" = 1 ] && continue
+        due="${entry%% *}"; text="${entry#* }"
+        [ "$clock" -ge "$due" ] || continue
+        if fill "$text"; then queued[$i]=1; fi
+      done < "$queue"
+    fi
+    if [ -f "$react" ]; then
+      i=0
+      while IFS= read -r entry; do
+        i=$((i + 1))
+        case "$entry" in prompt:*) ;; *) continue ;; esac
+        [ "${reacted[$i]:-0}" = 1 ] && continue
+        tag="${entry%% *}"; rest="${entry#* }"; n="${tag#prompt:}"; delay="${rest%% *}"; text="${rest#* }"
+        sigma="$(sigma_of "$n")"; [ -n "$sigma" ] || continue
+        [ "$clock" -ge "$((sigma + delay))" ] || continue
+        if fill "$text"; then reacted[$i]=1; fi
+      done < "$react"
+    fi
+  fi
+  sleep 0.05
+done
+exit 0

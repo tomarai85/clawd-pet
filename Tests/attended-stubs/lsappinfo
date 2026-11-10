@@ -1,0 +1,4 @@
+#!/bin/bash
+# Stub lsappinfo: `find bundleid=...` prints an application line only while $STUB_DIR/aqua.running exists.
+[ ! -f "$STUB_DIR/aqua.running" ] || printf 'ASN:0x0-0x3a43a4-"Aqua_Voice":\n'
+exit 0

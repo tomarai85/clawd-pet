@@ -1,0 +1,17 @@
+# Event blocks of Aqua Voice 0.21.4's main.log, sanitized as amendment D-12 step 5 allows and nothing else: the timestamp is one fixed date in the same
+# format, every number is a fixed number with the same digits-and-point form, every quoted string would be a fixed string in the same quotes (none
+# occur). Level, padding, source tag, key, field names, delimiters, braces, commas, true and false and enum-like values are as observed.
+# Read from the first 0.21.4 run (span from the first app.bootstrap after Info.plist's mtime). Every block below is one header line: no block of a
+# verified key had a continuation line in that span, so the multi-line path stays covered by the v1 fixtures (ack-reordered.log).
+# A line that does not start with "[" is inert to the parser, so these comment lines produce no event.
+[2026-10-17T12:00:00.000Z] [info]  (DictationOrchestrator)                  dictation.start_accepted lease_id=1 provider=online
+[2026-10-17T12:00:00.000Z] [info]  (DictationOrchestrator)                  dictation.start_accepted lease_id=12 provider=online
+[2026-10-17T12:00:00.000Z] [info]  (DictationOrchestrator)                  dictation.lock_accepted lease_id=12 provider=online
+[2026-10-17T12:00:00.000Z] [info]  (DictationOrchestrator)                  dictation.completed audio_duration_s=1.2345678 auto_enter=false has_audio_data=true lease_id=1 result_source=live session_id=123456789 text_length=12
+[2026-10-17T12:00:00.000Z] [info]  (DictationOrchestrator)                  dictation.completed audio_duration_s=1 auto_enter=false has_audio_data=false lease_id=1 result_source=none session_id=123456789 text_length=1
+# The ACK of 0.21.4 lists success first: "{ success: true, timestamp: N }" (0.21.2's lines had the timestamp first).
+[2026-10-17T12:00:00.000Z] [info]  (IPCFloating)                            PASTE_ACK received { success: true, timestamp: 1234567891.23456 }
+# SYNTHESIZED, not observed: Aqua logged no "success: false" ACK in the span. The next block is the block above with the one token true replaced by false.
+[2026-10-17T12:00:00.000Z] [info]  (IPCFloating)                            PASTE_ACK received { success: false, timestamp: 1234567891.23456 }
+[2026-10-17T12:00:00.000Z] [info]  (Main)                                   app.bootstrap arch=arm64 pid=12345 platform=darwin
+[2026-10-17T12:00:00.000Z] [info]  (SystemBridge)                           Shutdown initiated (pid: 12345)

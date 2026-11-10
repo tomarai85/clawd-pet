@@ -1,0 +1,99 @@
+#!/bin/sh
+# Builds the frozen launcher launcher/clawd-pet-launch from launcher/launcher.c and records its sha256 in
+# launcher/clawd-pet-launch.sha256. Both files are checked in. The launcher is built ONCE: `clawd-pet install` copies the checked-in
+# binary and verifies its sha256; it never calls this script, because a different launcher binary is a different background item for
+# macOS and shows the user the "App Background Activity" notice again.
+#
+#   scripts/build-launcher              build and record; refuses when the launcher or its record already exists
+#   scripts/build-launcher --rebuild    replace the checked-in launcher and its record on purpose (the notice comes back once)
+#   scripts/build-launcher --scratch D  build into directory D (which must exist) and touch nothing in the repo: for tests
+#   scripts/build-launcher --verify     exit 0 only when the checked-in binary matches its record; builds nothing
+#
+# The binary is arm64 (every machine of the fleet), ad-hoc signed with the identifier clawd-pet-launch, minimum macOS 13 (as the
+# package). Before anything is published the fresh binary is run twice: with no agent next to it (it must exit 111) and with a
+# stand-in agent next to it (the stand-in must be run as itself, with the same pid). Exit: 0 ok, 2 refused or failed.
+set -eu
+repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+src="$repo/launcher/launcher.c"
+out="$repo/launcher/clawd-pet-launch"
+record="$repo/launcher/clawd-pet-launch.sha256"
+
+fail() { echo "build-launcher: $*" >&2; exit 2; }
+usage() { echo "usage: scripts/build-launcher [--rebuild | --scratch DIR | --verify]" >&2; exit 2; }
+
+sha_of() { /usr/bin/shasum -a 256 < "$1" | cut -d' ' -f1; }
+
+mode=build; scratch=""
+case "${1:-}" in
+  "") ;;
+  --rebuild) mode=rebuild ;;
+  --verify) mode=verify ;;
+  --scratch) mode=scratch; scratch="${2:-}"; [ -n "$scratch" ] || usage ;;
+  *) usage ;;
+esac
+if [ "$mode" = scratch ]; then [ $# -eq 2 ] || usage; else [ $# -le 1 ] || usage; fi
+
+if [ "$mode" = verify ]; then
+  [ -f "$out" ] && [ -f "$record" ] || fail "launcher/clawd-pet-launch or its .sha256 record is missing"
+  [ "$(grep -c '' "$record")" -eq 1 ] || fail "the record must hold exactly one line"
+  want=$(cut -d' ' -f1 < "$record")
+  [ "$(sha_of "$out")" = "$want" ] || fail "launcher/clawd-pet-launch does not match its recorded sha256"
+  echo "build-launcher: launcher/clawd-pet-launch matches its record ($want)"
+  exit 0
+fi
+
+[ -f "$src" ] || fail "missing $src"
+if [ "$mode" = build ] && { [ -e "$out" ] || [ -e "$record" ]; }; then
+  fail "the launcher is already built and checked in; a new binary is a new background item for macOS (the notice comes back). Rebuild on purpose with --rebuild"
+fi
+if [ "$mode" = scratch ]; then
+  [ -d "$scratch" ] && [ ! -L "$scratch" ] || fail "$scratch is not a directory"
+  work=$(CDPATH= cd -- "$scratch" && pwd -P)
+else
+  mkdir -p "$repo/.build"
+  work=$(mktemp -d "$repo/.build/launcher-build.XXXXXX")
+fi
+built="$work/clawd-pet-launch"
+cleanup_work() {
+  # Removes only what this run made here, file by file.
+  rm -f -- "$work/clawd-pet-agent" "$work/probe.out"
+  if [ "$mode" != scratch ]; then rm -f -- "$built"; rmdir -- "$work" 2>/dev/null || true; fi
+}
+trap cleanup_work EXIT
+
+/usr/bin/clang -std=c11 -O2 -Wall -Wextra -Werror -arch arm64 -mmacosx-version-min=13.0 -o "$built" "$src" || fail "the compiler failed"
+/usr/bin/codesign --force --sign - --identifier clawd-pet-launch "$built" 2>/dev/null || fail "codesign failed"
+chmod 755 "$built"
+
+# Smoke 1: no agent next to it -> exit 111.
+rm -f -- "$work/clawd-pet-agent"
+rc=0; "$built" </dev/null >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 111 ] || fail "the launcher exited $rc with no agent next to it (111 expected)"
+# Smoke 2: a stand-in agent next to it is run in place of the launcher, as itself, with the launcher's pid.
+cat > "$work/clawd-pet-agent" <<'AGENT'
+#!/bin/sh
+printf '%s %s\n' "$0" "$$"
+AGENT
+chmod 755 "$work/clawd-pet-agent"
+"$built" </dev/null > "$work/probe.out" 2>/dev/null &
+launched=$!
+wait "$launched" || fail "the stand-in agent did not run through the launcher"
+read -r said_path said_pid < "$work/probe.out" || fail "the stand-in agent printed nothing"
+[ "$said_path" = "$work/clawd-pet-agent" ] || fail "the launcher ran '$said_path', not $work/clawd-pet-agent"
+[ "$said_pid" = "$launched" ] || fail "the agent ran as pid $said_pid, not the launcher's pid $launched (the launcher must exec, not fork)"
+
+sha=$(sha_of "$built")
+cdhash=$(/usr/bin/codesign -dvvv "$built" 2>&1 | sed -n 's/^CDHash=//p')
+if [ "$mode" = scratch ]; then
+  echo "build-launcher: scratch build $built sha256=$sha cdhash=$cdhash (nothing in the repo was touched)"
+  trap - EXIT
+  rm -f -- "$work/clawd-pet-agent" "$work/probe.out"
+  exit 0
+fi
+
+cp "$built" "$out.new"
+mv "$out.new" "$out"
+printf '%s  clawd-pet-launch\n' "$sha" > "$record.new"
+mv "$record.new" "$record"
+echo "build-launcher: built launcher/clawd-pet-launch sha256=$sha cdhash=$cdhash"
+echo "build-launcher: recorded in launcher/clawd-pet-launch.sha256. Check both files in; macOS shows the background-activity notice once for a new launcher."

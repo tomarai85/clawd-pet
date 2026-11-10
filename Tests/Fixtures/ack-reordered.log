@@ -1,0 +1,5 @@
+[2026-10-17T00:00:02.100Z] [info]  (IPCFloating)                            PASTE_ACK received { lease_id: 1, success: true }
+[2026-10-17T00:00:02.200Z] [info]  (IPCFloating)                            PASTE_ACK received {
+  lease_id: 1,
+  success: false
+}

@@ -1,0 +1,7 @@
+.build/
+.evidence/
+.DS_Store
+# screenshots and backups the art producer keeps for itself
+art/preview-check/
+art/tools/*.bak.*
+__pycache__/

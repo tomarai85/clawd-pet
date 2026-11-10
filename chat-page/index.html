@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'none'; connect-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clawd chat</title>
+<link rel="stylesheet" href="page.css">
+</head>
+<body>
+<!-- Structure mirrors NativeChatStructuredSession > NativeChatMessageList > NativeChatTranscriptRow > MessageRow (Orca, MIT). The transcript is
+     empty: page.js fills it from the entries Clawd sends. The composer is Clawd's native input under this view. -->
+<div class="native-chat-appearance">
+  <div class="pane">
+    <div class="scroller-wrap">
+      <div class="scroller" id="scroller">
+        <div class="transcript-outer">
+          <div class="transcript-column" id="column"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<script src="marked.min.js"></script>
+<script src="page.js"></script>
+</body>
+</html>

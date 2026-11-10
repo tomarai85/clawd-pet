@@ -1,0 +1,43 @@
+#!/bin/sh
+# Stub launchctl for the launcher test: it does what launchd does for a job whose plist says RunAtLoad.
+#   bootstrap <domain> <plist>  loads the job and starts ProgramArguments[0] as a NEW process whose environment holds
+#                               XPC_SERVICE_NAME=<label>; the pid of that process is the job's PID
+#   list <label>                prints the job with its "PID" while that process lives (the pid launchd started, never a child's)
+#   kickstart                   does nothing to a loaded job (launchd's kickstart without -k does not restart it)
+#   bootout                     stops the process this stub started, and only while its command line still names STUB_AGENT_EXEC
+# The process is released only after its pid is recorded, so a program that asks `list` at its first instruction already sees its own
+# PID, as it does under launchd.
+echo "launchctl $*" >> "$STUB_LOG"
+[ -z "${STUB_SHELL_LOG:-}" ] || /bin/ps -o comm= -p "$PPID" >> "$STUB_SHELL_LOG"
+LABEL=com.tomtim.clawd-pet
+PIDFILE="$STUB_STATE.pid"
+alive() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
+case "$1" in
+  list)
+    [ -f "$STUB_STATE" ] || exit 113
+    printf '{\n\t"Label" = "%s";\n' "$LABEL"
+    if alive; then printf '\t"PID" = %s;\n' "$(cat "$PIDFILE")"; fi
+    printf '};\n'
+    exit 0 ;;
+  bootstrap)
+    plist="${3:-}"
+    [ -f "$plist" ] || { echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; }
+    prog="$(/usr/bin/plutil -extract ProgramArguments.0 raw -o - "$plist")" || exit 5
+    : > "$STUB_STATE"
+    rm -f "$PIDFILE" "$PIDFILE.new"
+    ( while [ ! -f "$PIDFILE" ]; do sleep 0.01; done; XPC_SERVICE_NAME="$LABEL" exec "$prog" ) </dev/null >/dev/null 2>&1 &
+    echo $! > "$PIDFILE.new"
+    mv "$PIDFILE.new" "$PIDFILE"
+    exit 0 ;;
+  kickstart)
+    [ -f "$STUB_STATE" ] || { echo "Could not find service" >&2; exit 113; }
+    exit 0 ;;
+  bootout)
+    if alive; then
+      pid="$(cat "$PIDFILE")"
+      case "$(/bin/ps -o command= -p "$pid" 2>/dev/null)" in *"$STUB_AGENT_EXEC"*) kill "$pid" 2>/dev/null ;; esac
+    fi
+    rm -f "$STUB_STATE" "$PIDFILE"
+    exit 0 ;;
+esac
+exit 0

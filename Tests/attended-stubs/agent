@@ -1,0 +1,30 @@
+#!/bin/bash
+# Stand-in for the installed Mach-O ($ROOT/bin/clawd-pet-agent) in the post-install-check tests. It records its pid and behaves as
+# $STUB_DIR/agent.mode says (the real agent run outside launchd exits 0 at once):
+#   exit0    exit 0 at once            exit3    exit 3 at once
+#   linger   live for 0.3 s, then exit 0 (long enough to be looked at)
+#   linger3  live for 0.3 s, then exit 3
+#   linger1  live for 1 s, then exit 0
+#   slow     become `sleep 30` (the pid stays; the script under test must stop it)
+#   window  register a window of its own pid in the stub window list, live for 0.4 s, exit 0
+#   homewrite  behave like an agent whose launch guard regressed: write what the real agent writes (a data directory, agent.log,
+#              status.json) under $HOME, and record the HOME, CFFIXED_USER_HOME and working directory it was started with in
+#              $STUB_DIR/agent.home, agent.cffixed and agent.cwd; live for 0.3 s, exit 0
+echo "$$" >> "$STUB_DIR/agent.pids"
+echo "$0" >> "$STUB_DIR/agent.paths"
+case "$(cat "$STUB_DIR/agent.mode" 2>/dev/null || echo exit0)" in
+  exit0) exit 0 ;;
+  exit3) exit 3 ;;
+  linger) sleep 0.3; exit 0 ;;
+  linger3) sleep 0.3; exit 3 ;;
+  slow) exec sleep 30 ;;
+  linger1) sleep 1; exit 0 ;;
+  homewrite)
+    printf '%s\n' "$HOME" > "$STUB_DIR/agent.home"; printf '%s\n' "${CFFIXED_USER_HOME:-}" > "$STUB_DIR/agent.cffixed"; pwd -P > "$STUB_DIR/agent.cwd"
+    mkdir -p "$HOME/Library/Application Support/clawd-pet" || exit 4
+    printf 'agent started\n' >> "$HOME/Library/Application Support/clawd-pet/agent.log"
+    printf '{"focusViolations":0}\n' > "$HOME/Library/Application Support/clawd-pet/status.json"
+    sleep 0.3; exit 0 ;;
+  window) printf 'WINDOW %s 3 1 10.0 10.0 48.0 48.0 99\n' "$$" > "$STUB_DIR/windows.dynamic.$$"; sleep 0.4; exit 0 ;;
+esac
+exit 0

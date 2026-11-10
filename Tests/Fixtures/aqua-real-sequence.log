@@ -1,0 +1,11 @@
+[2026-10-14T15:50:24.649Z] [info]  (DictationOrchestrator)                  dictation.lock_accepted lease_id=73 provider=online
+[2026-10-14T15:50:31.795Z] [info]  (DictationOrchestrator)                  dictation.completed audio_duration_s=6.349625 auto_enter=false has_audio_data=true lease_id=73 result_source=live session_id=198380400 text_length=31
+[2026-10-14T15:50:32.573Z] [info]  (IPCFloating)                            PASTE_ACK received { timestamp: 1791993032.572922, success: true }
+[2026-10-14T15:50:34.400Z] [info]  (DictationOrchestrator)                  dictation.start_accepted lease_id=74 provider=online
+[2026-10-14T20:20:36.700Z] [info]  (SystemBridge)                           Shutdown initiated (pid: 22097)
+[2026-10-14T20:20:36.715Z] [error] (SystemBridge)                           Bridge stderr: LLVM Profile Error: Failed to write file "default.profraw": Read-only file system
+[2026-10-14T20:20:53.066Z] [info]  (Main)                                   app.bootstrap arch=arm64 pid=39195 platform=darwin
+[2026-10-15T16:09:04.645Z] [error]                                          [NativeAudioCaptureProvider] Audio capture stopped unexpectedly. The microphone may have disconnected.
+[2026-10-15T16:09:04.648Z] [warn]  (DictationRuntimeAdapter)                dictation.native_audio_capture_failed audio_duration_ms=74400 capture_elapsed_ms=78584 capture_id=1086bf09-6f6c-47
+[2026-10-16T07:26:18.159Z] [info]  (DictationOrchestrator)                  dictation.cancel_accepted lease_id=2
+[2026-10-16T07:26:18.398Z] [info]  (DictationOrchestrator)                  dictation.completed_canceled_stale lease_id=2 session_id=200070928

@@ -1,0 +1,57 @@
+#!/bin/sh
+# Stub launchctl for the `clawd-pet update` test: a loaded job whose pid CHANGES on `kickstart -k`, as launchd's does, and a stand-in
+# for the new agent process behind it. It records every call in STUB_LOG, so a test can assert which verbs update ever sent.
+#   STUB_STATE      the job is loaded while this file exists; <STUB_STATE>.pid holds the pid `list` reports (4242 until a restart)
+#   STUB_ROOT       the install root; the stand-in writes status.json there
+#   STUB_KICK_MODE  what the restarted "agent" does after `kickstart -k` (default ok)
+#     ok         the pid changes; status.json gets the new pid and appliedGeneration = control.json's generation
+#     delayed    the same, but STUB_KICK_DELAY seconds later (a background job; its pid goes to <STUB_STATE>.bg)
+#     nopid      launchd shows no new process: the pid stays
+#     silent     the pid changes, status.json is left as the OLD process wrote it (old pid, old appliedGeneration)
+#     nopidfield the pid changes, status.json holds the right appliedGeneration but no pid (an agent that does not write it)
+#     stale      the pid changes, status.json holds the new pid and an appliedGeneration one below control.json's (none when it is 0)
+#     fail       `kickstart -k` exits 1 and changes nothing
+#   `kickstart` without -k and `bootstrap`/`bootout` are recorded and obeyed (a test asserts update never sends them).
+echo "launchctl $*" >> "$STUB_LOG"
+[ -z "${STUB_SHELL_LOG:-}" ] || /bin/ps -o comm= -p "$PPID" >> "$STUB_SHELL_LOG"
+PIDFILE="$STUB_STATE.pid"
+current() { cat "$PIDFILE" 2>/dev/null || echo 4242; }
+generation() {
+  g="$(/usr/bin/plutil -extract generation raw -o - "$STUB_ROOT/control.json" 2>/dev/null)"
+  case "$g" in ''|*[!0-9]*) g=0 ;; esac
+  echo "$g"
+}
+write_status() { # pid applied
+  printf '{"focusViolations":0,"wakeCount":0,"displayChangeCount":0,"pid":%s,"appliedGeneration":%s}\n' "$1" "$2" > "$STUB_ROOT/status.json.new" \
+    && mv "$STUB_ROOT/status.json.new" "$STUB_ROOT/status.json"
+}
+case "$1" in
+  list)
+    [ -f "$STUB_STATE" ] || exit 113
+    printf '{\n\t"Label" = "com.tomtim.clawd-pet";\n\t"PID" = %s;\n};\n' "$(current)"
+    exit 0 ;;
+  bootstrap) : > "$STUB_STATE"; exit 0 ;;
+  bootout) rm -f "$STUB_STATE" "$PIDFILE"; exit 0 ;;
+  kickstart)
+    [ -f "$STUB_STATE" ] || { echo "Could not find service" >&2; exit 113; }
+    [ "${2:-}" = "-k" ] || exit 0
+    mode="${STUB_KICK_MODE:-ok}"
+    [ "$mode" != fail ] || exit 1
+    [ "$mode" != nopid ] || exit 0
+    new=$(( $(current) + 1 ))
+    echo "$new" > "$PIDFILE"
+    gen="$(generation)"
+    case "$mode" in
+      ok) write_status "$new" "$gen" ;;
+      delayed)
+        ( sleep "${STUB_KICK_DELAY:-1}"; write_status "$new" "$gen" ) </dev/null >/dev/null 2>&1 &
+        echo $! >> "$STUB_STATE.bg" ;;
+      nopidfield) printf '{"focusViolations":0,"appliedGeneration":%s}\n' "$gen" > "$STUB_ROOT/status.json" ;;
+      stale)
+        if [ "$gen" -gt 0 ]; then write_status "$new" "$((gen - 1))"
+        else printf '{"focusViolations":0,"pid":%s}\n' "$new" > "$STUB_ROOT/status.json"; fi ;;
+      silent) ;;
+    esac
+    exit 0 ;;
+esac
+exit 0

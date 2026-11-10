@@ -1,0 +1,40 @@
+{
+  "color_space" : "kCGColorSpaceSRGB",
+  "drawing_flags_version" : 1,
+  "fonts" : [
+    {
+      "path" : "\/System\/Library\/Fonts\/SFNS.ttf",
+      "role" : "ui",
+      "sha256" : "b8538196e9594212d1b0fcfa6b6d76550d087923b30f30bc885d6c2744238154"
+    },
+    {
+      "path" : "system font .AppleSystemUIFontMonospaced-Regular",
+      "role" : "mono",
+      "sha256" : "b945c8f8db70caae7a841aeb89d465f47ef3c0429b949708046968292d437e2d"
+    },
+    {
+      "path" : "\/System\/Library\/Fonts\/Menlo.ttc",
+      "role" : "marks",
+      "sha256" : "6f118b9d826a81bb7296dc11e193b49088e85844305dce48be2c7c585a513a4f"
+    }
+  ],
+  "manifest" : {
+    "bubble\/style14-listening-below-px1-dark.png" : "40852cf8fbf8f28c94b12ac293b39ad0ab04c8c1a407d2c7f26216eaee9a9c7e",
+    "bubble\/style14-listening-below-px1-light.png" : "755319cb188ee2ffd7e831970d5ab27bcc26b84353225e3989e2b966b8d73af5",
+    "bubble\/style14-listening-below-px2-dark.png" : "a2b486c286abfcf5ad15428657ef8f294bfdf86fe7d18cb3533c7659a454908c",
+    "bubble\/style14-listening-below-px2-light.png" : "9e9ae2ef918d8adedc8f5380836e5e87efda3b4b1a71cc4767829a2ded8f6190",
+    "bubble\/style14-thinking-below-px1-dark.png" : "c607bf34d1ad789dac5f2dbe0eed32dc9a94ffd113e4d28f05c38ece408618d6",
+    "bubble\/style14-thinking-below-px1-light.png" : "cb1ae3cf3ac5ed8fbbc26425a3ad71b5143ef2108f998b22d9cd339a979b47c5",
+    "bubble\/style14-thinking-below-px2-dark.png" : "f26f0662b9dcfaf74eaed49e161239d7a3baca31e40abd4a3caef3b6cc926a6a",
+    "bubble\/style14-thinking-below-px2-light.png" : "349fe41dbd3ea5a81a5b731138eba6b1b12c6c5587fad93a85f1bc813582f186",
+    "bubble\/style15-listening-below-px1-dark.png" : "19f5bc19f9971050a918d0165280196140f38d67ea625824f66ffb418b2e3f89",
+    "bubble\/style15-listening-below-px1-light.png" : "9f8cfad51d350d8f4e954d19263249c059d2caa6b9de12948a6b7fd27e55b16e",
+    "bubble\/style15-listening-below-px2-dark.png" : "2532e322c243774be5f1a003abdfaeeaa64bda640b947af6a8f8cb4547324e3c",
+    "bubble\/style15-listening-below-px2-light.png" : "9f79146b20667770d4d91aa562c2c4f44aebee6c342283d9755ba389c541d87f",
+    "bubble\/style15-thinking-below-px1-dark.png" : "9b303724ce9f96c64c729b8f20d75674194ede4cccb020d6160e68443df8f50c",
+    "bubble\/style15-thinking-below-px1-light.png" : "865dc908c351641114fe8252817f43246edbbdfacfb5d898d3ad532eedda30c1",
+    "bubble\/style15-thinking-below-px2-dark.png" : "830472d4111831e234ea559dd7a4d5fcdaf821ef26adcc936707df6596e48d79",
+    "bubble\/style15-thinking-below-px2-light.png" : "2c9e14fe4146d30996e064649059f66deaf61e2eb80551d12d4e368ee3fe8e97"
+  },
+  "sw_vers" : "ProductName:\t\tmacOS\nProductVersion:\t\t27.0.1\nBuildVersion:\t\t26A434\n"
+}

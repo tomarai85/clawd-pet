@@ -1,0 +1,687 @@
+{
+  "_meta": {
+    "source_binary": "/Users/tomtim/.local/share/claude-stable/claude-1",
+    "claude_code_version": "2.1.301",
+    "note": "Offsets are absolute byte offsets into the binary. Values parsed from minified JS (escapes decoded). Theme = dark (the default branch of the theme switch).",
+    "version_offset": 194854092,
+    "items": [
+      "spinner_glyphs",
+      "spinner_timing",
+      "verb_shimmer",
+      "present_verbs",
+      "ellipsis",
+      "past_verbs",
+      "turn_complete_line",
+      "interrupt",
+      "error_line",
+      "input_box",
+      "theme_colors_dark",
+      "welcome_clawd_block_art"
+    ]
+  },
+  "spinner_glyphs": {
+    "default_sequence": [
+      "·",
+      "✢",
+      "✳",
+      "✶",
+      "✻",
+      "✽"
+    ],
+    "ghostty_sequence": [
+      "·",
+      "✢",
+      "✳",
+      "✶",
+      "✻",
+      "✻"
+    ],
+    "other_sequence_T": [
+      "·",
+      "✢",
+      "*",
+      "✶",
+      "✻",
+      "✽"
+    ],
+    "ping_pong_array": [
+      "·",
+      "✢",
+      "✳",
+      "✶",
+      "✻",
+      "✽",
+      "✽",
+      "✻",
+      "✶",
+      "✳",
+      "✢",
+      "·"
+    ],
+    "selected_by": "TERM==='xterm-ghostty' ? l : p (default p); ping-pong array f=[...p,...p.toReversed()] / d=[...l,...l.toReversed()]",
+    "offset": 214817361,
+    "source": "var l=[\"\\xB7\",\"\\u2722\",\"\\u2733\",\"\\u2736\",\"\\u273B\",\"\\u273B\"],p=[\"\\xB7\",\"\\u2722\",\"\\u2733\",\"\\u2736\",\"\\u273B\",\"\\u273D\"],T=[\"\\xB7\",\"\\u2722\",\"*\",\"\\u2736\",\"\\u273B\",\"\\u273D\"],d=[...l,...l.toReversed()],f=[...p,...p.toReversed()],y=[...T,...T.toReversed()];function jbn(){",
+    "selector_offset": 214817609,
+    "selector_source": "function jbn(){if(a.TERM===\"xterm-ghostty\")return l;return p}function iDe(){if(a.TERM===\"xterm-ghostty\")return d;return f}",
+    "chunk_note": "chunk-9yq4gdkw.js (module header 'var l=[...],p=[...],T=[...],d=[...l,...l.toReversed()],f=[...p,...p.toReversed()]')"
+  },
+  "spinner_timing": {
+    "clock_tick_ms": {
+      "value": 100,
+      "requesting_mode_ms": 50,
+      "reduced_motion": "clock off (null); static glyph U+25CF with 2000 ms opacity pulse (M=2000)",
+      "offset": 221691662,
+      "source": "[v,T]=ka(t?null:l===\"requesting\"&&!S?50:100),A=Date.now(),nt=L&&f!==null?Math.max(0,A-f):B!==null?B-h-C:A-h-C,Y=R(Ue()),"
+    },
+    "frame_index_formula": {
+      "value": "index = Math.round(((1 - cos(2*pi*t/2000)) / 2) * (6 - 1)), t = clock time in ms, indexes the 6-glyph default sequence (Rde reads the 12-element ping-pong array at the same index 0..5, so only the first half is reached)",
+      "period_ms": 2000,
+      "glyph_count": 6,
+      "offsets": {
+        "Xn": 221690885,
+        "aDe": 214817816,
+        "qn": 221690829,
+        "Rde_index_read": 215038282
+      },
+      "source": [
+        "function Xn(l){let t=aDe(l,qn);return Math.round(t*(jbn().length-1))}function to(l){return`thought for ${Math.",
+        "function aDe(r,t){return(1-Math.cos(2*Math.PI*r/t))/2}function vy(r,t,i){return{",
+        ",qn=2000,zn=200,le=1",
+        "o=q[le%q.length];if(p>0){let I=m[l];let r;if(a[11]!==I||a[12"
+      ]
+    },
+    "ping_pong": {
+      "value": true,
+      "how": "emergent: the cosine easing runs index 0 -> 5 -> 0 over each 2000 ms period (dwells at both ends). The 12-element ping-pong array exists but its second half is not reached by the main spinner."
+    },
+    "derived_timeline_100ms_ticks": {
+      "t_ms": [
+        0,
+        100,
+        200,
+        300,
+        400,
+        500,
+        600,
+        700,
+        800,
+        900,
+        1000,
+        1100,
+        1200,
+        1300,
+        1400,
+        1500,
+        1600,
+        1700,
+        1800,
+        1900
+      ],
+      "index": [
+        0,
+        0,
+        0,
+        1,
+        2,
+        2,
+        3,
+        4,
+        5,
+        5,
+        5,
+        5,
+        5,
+        4,
+        3,
+        3,
+        2,
+        1,
+        0,
+        0
+      ],
+      "glyphs": [
+        "·",
+        "·",
+        "·",
+        "✢",
+        "✳",
+        "✳",
+        "✶",
+        "✻",
+        "✽",
+        "✽",
+        "✽",
+        "✽",
+        "✽",
+        "✻",
+        "✶",
+        "✶",
+        "✳",
+        "✢",
+        "·",
+        "·"
+      ]
+    },
+    "small_inline_spinner": {
+      "value": "linear walk through the 12-element ping-pong array, 120 ms per frame, color 'text'; reduced motion: static U+25CF",
+      "frame_ms": 120,
+      "offsets": {
+        "ka_120": 221708016,
+        "frame_pick": 221708302
+      },
+      "source": [
+        "[u,o]=ka(t?null:120);if(t){let g;if(m[0]===b)g=e(n,{color:\"text\",children:\"\\u25C",
+        "B=Math.floor(o/120)%C.length;const h=C[B];let _;if(m[4]!==h)"
+      ]
+    },
+    "reduced_motion_dot": {
+      "glyph": "●",
+      "pulse_period_ms": 2000,
+      "offset": 215037326,
+      "source": "var _wt=\"\\u25CF\",M=2000,P={r:171,g:43,b:63},T={r:0,g:0,b:0};"
+    }
+  },
+  "verb_shimmer": {
+    "window_cols": 3,
+    "window_source": "kt=m-1, xt=m+1: glimmerIndex m +/- 1 drawn in shimmer color (3 characters)",
+    "modes": {
+      "requesting": {
+        "cols_per_step": 1,
+        "step_ms": 50,
+        "direction": "left to right",
+        "formula": "glimmerIndex = (floor(t/50) % (width+20)) - 10"
+      },
+      "other (thinking/responding)": {
+        "cols_per_step": 1,
+        "step_ms": 200,
+        "direction": "right to left",
+        "formula": "glimmerIndex = (width+10) - (floor(t/200) % (width+20))"
+      }
+    },
+    "pad_cols": 10,
+    "offsets": {
+      "glimmer_formula": 221692669,
+      "zn_le": 221690838
+    },
+    "source": [
+      "onse_length:M,render_loop_dark:X-tt>5000})}let ft=t?0:Xn(T),J=l===\"requesting\"?50:zn,gt=Z(()=>ie(m),[m]),dt=gt+2*le,ht=Math.floor(T/J),Lt=t?-100:H?-100:l===\"requesting\"?ht%dt-le:gt+le-ht%dt,At=t?0:l==",
+      "zn=200,le=10,Yn=1e4,Jn=20000,Qn=30000,Zn"
+    ]
+  },
+  "present_verbs": {
+    "count": 188,
+    "values": [
+      "Accomplishing",
+      "Actioning",
+      "Actualizing",
+      "Architecting",
+      "Baking",
+      "Beaming",
+      "Beboppin'",
+      "Befuddling",
+      "Billowing",
+      "Blanching",
+      "Bloviating",
+      "Boogieing",
+      "Boondoggling",
+      "Booping",
+      "Bootstrapping",
+      "Brewing",
+      "Bunning",
+      "Burrowing",
+      "Calculating",
+      "Canoodling",
+      "Caramelizing",
+      "Cascading",
+      "Catapulting",
+      "Cerebrating",
+      "Channeling",
+      "Choreographing",
+      "Churning",
+      "Clauding",
+      "Coalescing",
+      "Cogitating",
+      "Combobulating",
+      "Composing",
+      "Computing",
+      "Concocting",
+      "Considering",
+      "Contemplating",
+      "Cooking",
+      "Crafting",
+      "Creating",
+      "Crunching",
+      "Crystallizing",
+      "Cultivating",
+      "Deciphering",
+      "Deliberating",
+      "Determining",
+      "Dilly-dallying",
+      "Discombobulating",
+      "Doing",
+      "Doodling",
+      "Drizzling",
+      "Ebbing",
+      "Effecting",
+      "Elucidating",
+      "Embellishing",
+      "Enchanting",
+      "Envisioning",
+      "Fermenting",
+      "Fiddle-faddling",
+      "Finagling",
+      "Flambéing",
+      "Flibbertigibbeting",
+      "Flowing",
+      "Flummoxing",
+      "Fluttering",
+      "Forging",
+      "Forming",
+      "Frolicking",
+      "Frosting",
+      "Gallivanting",
+      "Galloping",
+      "Garnishing",
+      "Generating",
+      "Gesticulating",
+      "Germinating",
+      "Gitifying",
+      "Grooving",
+      "Gusting",
+      "Harmonizing",
+      "Hashing",
+      "Hatching",
+      "Herding",
+      "Honking",
+      "Hullaballooing",
+      "Hyperspacing",
+      "Ideating",
+      "Imagining",
+      "Improvising",
+      "Incubating",
+      "Inferring",
+      "Infusing",
+      "Ionizing",
+      "Jitterbugging",
+      "Julienning",
+      "Kerfuffling",
+      "Kneading",
+      "Leavening",
+      "Levitating",
+      "Lollygagging",
+      "Manifesting",
+      "Marinating",
+      "Meandering",
+      "Metamorphosing",
+      "Misting",
+      "Moonwalking",
+      "Moseying",
+      "Mulling",
+      "Mustering",
+      "Nebulizing",
+      "Nesting",
+      "Newspapering",
+      "Noodling",
+      "Nucleating",
+      "Onioning",
+      "Orbiting",
+      "Orchestrating",
+      "Osmosing",
+      "Perambulating",
+      "Percolating",
+      "Perusing",
+      "Philosophizing",
+      "Photosynthesizing",
+      "Polishing",
+      "Pollinating",
+      "Pondering",
+      "Pontificating",
+      "Pouncing",
+      "Precipitating",
+      "Prestidigitating",
+      "Processing",
+      "Proofing",
+      "Propagating",
+      "Puttering",
+      "Puzzling",
+      "Quantumizing",
+      "Razzle-dazzling",
+      "Razzmatazzing",
+      "Recombobulating",
+      "Reticulating",
+      "Roosting",
+      "Ruminating",
+      "Sautéing",
+      "Scampering",
+      "Schlepping",
+      "Scurrying",
+      "Seasoning",
+      "Shenaniganing",
+      "Shimmying",
+      "Simmering",
+      "Skedaddling",
+      "Sketching",
+      "Slithering",
+      "Smooshing",
+      "Sock-hopping",
+      "Spelunking",
+      "Spinning",
+      "Sprouting",
+      "Stewing",
+      "Sublimating",
+      "Swirling",
+      "Swooping",
+      "Symbioting",
+      "Synthesizing",
+      "Tempering",
+      "Thinking",
+      "Thundering",
+      "Tinkering",
+      "Tomfoolering",
+      "Topsy-turvying",
+      "Transfiguring",
+      "Transmogrifying",
+      "Transmuting",
+      "Twisting",
+      "Undulating",
+      "Unfurling",
+      "Unraveling",
+      "Vibing",
+      "Waddling",
+      "Wandering",
+      "Warping",
+      "Whatchamacalliting",
+      "Whirlpooling",
+      "Whirring",
+      "Whisking",
+      "Wibbling",
+      "Working",
+      "Wrangling",
+      "Zesting",
+      "Zigzagging"
+    ],
+    "offset": 214745614,
+    "source_head": "var v=[\"Accomplishing\",\"Actioning\",\"Actualizing\",\"Architecting\",\"Baking\",\"Beaming\",\"Beboppin'\",\"Befuddling\",\"Billowing\",\"Blanching\",\"Bloviating\",\"Boogieing\",\"Boondoggling\",\"Booping\",\"Bootstrapping\",\"B",
+    "source_tail": "ing\",\"Whatchamacalliting\",\"Whirlpooling\",\"Whirring\",\"Whisking\",\"Wibbling\",\"Working\",\"Wrangling\",\"Zesting\",\"Zigzagging\"];",
+    "note": "Spinner verb array v (chunk with 'Spinner ignored an API retry status'). Also includes n.verbs from user settings spinnerVerbs; this is the built-in default list. Rendered as verb + U+2026 (message ends with the ellipsis; the spinner strips it with m.replace(/\\u2026$/,''))."
+  },
+  "ellipsis": {
+    "value": "…",
+    "offset": 203107084,
+    "source": "ellipsis:\"\\u2026\",pointerSmall:\"\\u203A\","
+  },
+  "past_verbs": {
+    "absent": false,
+    "count": 8,
+    "values": [
+      "Baked",
+      "Brewed",
+      "Churned",
+      "Cogitated",
+      "Cooked",
+      "Crunched",
+      "Sautéed",
+      "Worked"
+    ],
+    "default": "Worked",
+    "offset": 224690913,
+    "source": "var eg=[\"Baked\",\"Brewed\",\"Churned\",\"Cogitated\",\"Cooked\",\"Crunched\",\"Saut\\xE9ed\",\"Worked\"];",
+    "pick_rule_offset": 224691003,
+    "pick_rule_source": "var TN=\"Worked\";function og(m){let d=(ede(m)>>>0)%eg.length;return eg[d]??TN}function $Me({tasks:m,queuedCommands:d=[]})",
+    "pick_rule": "index = (hash(message uuid) >>> 0) % 8; fallback 'Worked'"
+  },
+  "turn_complete_line": {
+    "format": "<prefix glyph, dim, in a minWidth-2 box> + '<pastVerb> for <duration>' (dim); optional ' · done <time>' suffix",
+    "prefix_glyph": "✻",
+    "prefix_glyph_name": "JA",
+    "prefix_glyph_offset": 195776086,
+    "prefix_glyph_source": ",J0e=\"\\u2219\",Hyt=\"\\u2022\",pzs=\"\\u2315\",JA=\"\\u273B\",SNo=\"\\u2726\",bNo=\"\\u2571\",BU",
+    "template_offset": 224702282,
+    "template_source": ",width:\"100%\",children:[e(s,{minWidth:2,children:e(n,{\"aria-hidden\":!0,dimColor:!0,children:JA})}),r(n,{children:[W&&(ue?ye:e(n,{dimColor:!0,children:`${g} for ${B}${j?` \\xB7 done ${j}`:\"\"}`})),ce&&e(n,{dimColor:!0,child",
+    "duration_format": "nn(ms): <60 s -> 'Ns' (floor); else 'Xm Ys' / 'Xh Ym Zs' / 'Xd Xh Xm'",
+    "duration_offset": 196057312,
+    "duration_source": "function nn(e,t){if(e<60000){if(e===0)return\"0s\";if(e<1)return`${(e/1000).toFixed(1)}s`;return`${Math.floor(e/1000).toString()}s`}let n=Math.floor(e/86400000),i=Math.floor(e%86400000/3600000),r=Math.floor(e%3600000/60000",
+    "examples": [
+      "✻ Cooked for 5s",
+      "✻ Worked for 1m 12s"
+    ],
+    "color": "dimColor (SGR faint), prefix glyph also dimColor"
+  },
+  "interrupt": {
+    "string": "Interrupted",
+    "string_with_followup": "Interrupted · What should Claude do instead?",
+    "rendered": "  ⎿  Interrupted",
+    "prefix": "  ⎿  ",
+    "prefix_note": "MessageResponse prefix: two spaces, U+23BF, space, NBSP; whole prefix dimColor. 'Interrupted' alone is shown when flag _t is set; otherwise 'Interrupted ' + dim '· What should Claude do instead?'",
+    "color": "dimColor (text) -> use theme 'inactive' rgb(153,153,153) as the flat equivalent",
+    "component_offset": 224531645,
+    "component_source": "function Ka(){return\"What should Claude do instead?\"}var _t=zt(!1);function Va(){let d=w(3);if(ve(_t)){let p;if(d[0]===b)p=e(n,{dimColor:!0,children:\"Interrupted\"}),d[0]=p;else p=d[0];return p}let p;if(d[1]===b)p=e(n,{dimColor:!0,children:\"Interrupted \"}),d[1]=p;else p=d[1];let g;if(d[2]===b)g=r(Q,{children:[p,r(n,{dimColor:!0,children:[\"\\xB7 \",Ka()]})]}),d[2]=g;else g=d[2];return g}function Qg(){",
+    "prefix_offset": 221668796,
+    "prefix_source": "children:[\"  \",\"\\u23BF \\xA0\"]})}),i[0]=c,i[1]=d,i[2]=a;else a=i[2];let f;if(i[3]!==t)f=e(s,{flexShrink:1,flexGrow:1,children:t}),i[3]=t,i[4]=f;else f=i[4];let l;if(i[5]!==o||i[6]!==a||i[7]!="
+  },
+  "error_line": {
+    "form": "  ⎿  Error: <message>",
+    "prefix": "  ⎿   (same MessageResponse prefix, dim)",
+    "text_color_key": "error",
+    "text_prefix": "Error: ",
+    "rule": "tool error text is used verbatim if it starts with 'Error: ' or 'Cancelled: ', else 'Error: ' + text; rendered with color 'error'",
+    "other_error_labels": [
+      "File not found",
+      "Error searching files",
+      "Error editing file",
+      "Error writing file",
+      "Error reading file",
+      "API error"
+    ],
+    "offset": 224436671,
+    "source": "0,u[10]=h,u[11]=o,u[12]=m;else m=u[12];let k=m;let j=a||h;if(k===void 0)l=\"Tool execution failed\";else{let p=(j?rH(k):ttt(rH(Rs(k,\"tool_use_error\")??k)).replace(/<\\/?error>/g,\"\")).trim();if(!t&&!j&&p.startsWith(\"InputValidationError: \"))l=\"Invalid tool parameters\";else if(p.startsWith(\"Error: \")||p.startsWith(\"Cancelled: \"))l=p;else l=`Error: ${p}`}T=Ft(l,`\n`)+1-Rut;g=Ge;_=s;O=\"column\";v=n;R=\"error\";y=t?l:l.split(`\n`).slice(0,Rut).join(`\n`);u[0]=o,u[1]=a,u"
+  },
+  "input_box": {
+    "border_style": "round, left and right borders off (top and bottom horizontal rules only; borderBottom explicit, top default)",
+    "border_chars_round": {
+      "topLeft": "╭",
+      "top": "─",
+      "topRight": "╮",
+      "right": "│",
+      "bottomRight": "╯",
+      "bottom": "─",
+      "bottomLeft": "╰",
+      "left": "│"
+    },
+    "border_color_key": "promptBorder (bash mode: bashBorder)",
+    "prompt_char": "❯",
+    "prompt_char_fallback_ascii": ">",
+    "prompt_rendered": "dimColor",
+    "prompt_prefix_function_offset": 226832734,
+    "prompt_prefix_source": "function IT({mode:h,agent:T,maxWidth:M}){return(h===\"bash\"?\"!\":T?ut(WM(T.text),Math.max(1,Math.min(TJt,M-1))):te.pointer)+yzs}function xpe(h){return i",
+    "border_function_offset": 226831929,
+    "border_function_source": "function oD(h,T){if(T)return{};return{borderColor:CJt(h),borderStyle:\"round\",borderLeft:!1,borderRight:!1,borderBottom:!0}}function CJt(h){i",
+    "round_chars_offset": 198671794,
+    "round_chars_source": "round:{topLeft:\"\\u256D\",top:\"\\u2500\",topRight:\"\\u256E\",right:\"\\u2502\",bottomRight:\"\\u256F\",bottom:\"\\u2500\",bottomLeft:\"\\u2570\",left:\"\\u2502\"},bold:{topLeft:\"\\u250F\",top:\"\\u2501\",topRight:\"\\u",
+    "pointer_unicode_offset": 203112409,
+    "pointer_ascii_offset": 203113051,
+    "note": "The pet chip draws a fully rounded rect (spec) with these gray rules and a '❯ ' prompt; the real TUI draws only top/bottom rules. Cursor blink rate not extracted."
+  },
+  "theme_colors_dark": {
+    "theme": "dark (switch default branch 'default:return p'; p = dark palette)",
+    "palette_offset": 199295448,
+    "switch_offset": 199300446,
+    "switch_source": "nbow_indigo:\"rgb(155,130,200)\",rainbow_violet:\"rgb(200,130,180)\",rainbow_red_shimmer:\"rgb(250,155,147)\",rainbow_orange_shimmer:\"rgb(255,185,137)\",rainbow_yellow_shimmer:\"rgb(255,225,155)\",rainbow_green_shimmer:\"rgb(185,230,180)\",rainbow_blue_shimmer:\"rgb(180,205,240)\",rainbow_indigo_shimmer:\"rgb(195,180,230)\",rainbow_violet_shimmer:\"rgb(230,180,210)\"};function rj(r){switch(r){case\"light\":return U;case\"light-ansi\":return I;case\"dark-ansi\":return x;case\"light-daltonized\":return W;case\"dark-daltonized\":return P;default:return p}}function F4(r){if(typeof r!==\"string\")return!1;if(/^rgb\\(\\s?\\d{1,3},",
+    "values": {
+      "claude": "rgb(215,119,87)",
+      "claudeShimmer": "rgb(235,159,127)",
+      "promptBorder": "rgb(136,136,136)",
+      "promptBorderShimmer": "rgb(166,166,166)",
+      "text": "rgb(255,255,255)",
+      "inactive": "rgb(153,153,153)",
+      "inactiveShimmer": "rgb(193,193,193)",
+      "subtle": "rgb(80,80,80)",
+      "error": "rgb(255,107,128)",
+      "success": "rgb(78,186,101)",
+      "warning": "rgb(255,193,7)",
+      "suggestion": "rgb(177,185,249)",
+      "permission": "rgb(177,185,249)",
+      "bashBorder": "rgb(253,93,177)",
+      "clawd_body": "rgb(215,119,87)",
+      "clawd_background": "rgb(0,0,0)",
+      "userMessageBackground": "rgb(55, 55, 55)"
+    },
+    "roles": {
+      "claude_orange": "rgb(215,119,87)",
+      "spinner_shimmer": "rgb(235,159,127)",
+      "dim_inactive_gray": "rgb(153,153,153)",
+      "input_border_gray": "rgb(136,136,136)",
+      "error_red": "rgb(255,107,128)",
+      "success_green": "rgb(78,186,101)",
+      "spinner_message_color_key": "claude (default xt=\"claude\", shimmer wt=\"claudeShimmer\")"
+    },
+    "clawd_body_check": "clawd_body == claude == rgb(215,119,87) in dark; light theme claude is also rgb(215,119,87), claudeShimmer rgb(245,149,117)",
+    "spinner_color_defaults_offset": 221704496,
+    "spinner_color_defaults_source": "xt=\"claude\",wt=\"claudeShimmer\",z=g??xt,rt=h??wt,at=k(\"tengu_"
+  },
+  "welcome_clawd_block_art": {
+    "found_in_binary": "composed from segments (data-driven component aAe), not stored as three literal lines",
+    "default_pose": {
+      "eyes": "open",
+      "arms": "down",
+      "feet": "both"
+    },
+    "assembled_rows_default_pose": [
+      " ▐▛███▛█",
+      "▝▜██████▀",
+      " ▝▝   ▝▝ "
+    ],
+    "assembled_rows_note": "row0 = r1L ' ▐' + eyes glyphs (column 2) + r1R ''; row1 = r2L + 5 full blocks (column 2) + r2R; row2 = feet string. Eye glyph cells are painted fg orange on bg black (clawd_background), so the black eye is the empty quadrant of '▛'. Orange = theme 'clawd_body'. 9 cells wide x 3 cells tall (quadrant glyphs: 18 x 6 sub-cells).",
+    "segments": {
+      "arms": {
+        "down": {
+          "r1L": " ▐",
+          "r1R": "",
+          "r2L": "▝▜",
+          "r2R": "█▀"
+        },
+        "up": {
+          "r1L": "▗▟",
+          "r1R": "▄",
+          "r2L": " ▜",
+          "r2R": "█▘"
+        }
+      },
+      "eyes": {
+        "open": [
+          "▛███▛█"
+        ],
+        "left": [
+          "▟███▟█"
+        ],
+        "right": [
+          "█▟███▟"
+        ],
+        "closed": [
+          "▂",
+          "███",
+          "▂",
+          "█"
+        ],
+        "wink": [
+          "▛███",
+          "▂",
+          "█"
+        ]
+      },
+      "feet": {
+        "both": " ▝▝   ▝▝ ",
+        "left": " ▝▝      ",
+        "right": "      ▝▝ "
+      },
+      "apple_terminal_fallback_eye_rows": {
+        "open": " ▗   ▖ ",
+        "left": " ▘   ▘ ",
+        "right": " ▝   ▝ ",
+        "closed": " ▂   ▂ ",
+        "wink": " ▗   ▂ "
+      }
+    },
+    "poses_defined": {
+      "default": {
+        "eyes": "open",
+        "arms": "down",
+        "feet": "both"
+      },
+      "arms-up": {
+        "eyes": "open",
+        "arms": "up",
+        "feet": "both"
+      },
+      "look-left": {
+        "eyes": "left",
+        "arms": "down",
+        "feet": "both"
+      },
+      "look-right": {
+        "eyes": "right",
+        "arms": "down",
+        "feet": "both"
+      }
+    },
+    "assembled_rows_per_pose": {
+      "default": [
+        " ▐▛███▛█",
+        "▝▜██████▀",
+        " ▝▝   ▝▝ "
+      ],
+      "arms-up": [
+        "▗▟▛███▛█▄",
+        " ▜██████▘",
+        " ▝▝   ▝▝ "
+      ],
+      "look-left": [
+        " ▐▟███▟█",
+        "▝▜██████▀",
+        " ▝▝   ▝▝ "
+      ],
+      "look-right": [
+        " ▐█▟███▟",
+        "▝▜██████▀",
+        " ▝▝   ▝▝ "
+      ]
+    },
+    "subpixel_grid_default_pose": [
+      "...#############..",
+      "...##o#######o##..",
+      ".#################",
+      "...#############..",
+      "...#.#.......#.#..",
+      ".................."
+    ],
+    "subpixel_grid_legend": "18 sub-columns x 6 sub-rows (each terminal cell = 2x2 quadrants). '#' = orange, 'o' = black eye (empty quadrant inside an eye-painted cell), '.' = transparent",
+    "facing_poses_raw": "{\"right-12\":[{glyphs:\" ▐█▜██▛█ \",from:2,to:8},{glyphs:\"▝▜██████▀\",from:2,to:7},{glyphs:\" ▝▝   ▝▝ \",from:0,to:0}],\"right-30\":[{glyphs:\"  █▛██▛▌ \",from:2,to:7},{glyphs:\" ▝█████▛ \",from:2,to:7},{glyphs:\"  ▘▘  ▘▘ \",from:0,to:0}],\"right-55\":[{glyphs:\"  ▐█▛█▜  \",from:3,to:7},{glyphs:\"  ▐████  \",from:3,to:7},{glyphs:\"  ▝▝ ▝▝  \",from:0,to:0}],\"right-75\":[{glyphs:\"   ██▛▌  \",from:3,to:6},{glyphs:\"   ███▌  \",from:3,to:6},{glyphs:\"   ▘  ▘  \",from:0,to:0}],edge:[{glyphs:\"   ▐██   \",from:4,to:6},{glyphs:\"   ▐██   \",from:4,to:6},{glyphs:\"   ▝ ▝   \",from:0,to:0}],\"back-105\":[{glyphs:\"   ███▌  \",from:3,to:6},{glyphs:\"   ███▌  \",from:3,to:6},{glyphs:\"   ▘  ▘  \",from:0,to:0}],\"back-125\":[{glyphs:\"  ▐████  \",from:3,to:7},{glyphs:\"  ▐████  \",from:3,to:7},{glyphs:\"  ▝▝ ▝▝  \",from:0,to:0}],\"back-150\":[{glyphs:\"  █████▌ \",from:2,to:7},{glyphs:\" ▝█████▛ \",from:2,to:7},{glyphs:\"  ▘▘  ▘▘ \",from:0,to:0}],back:[{glyphs:\" ▐██████ \",from:2,to:8},{glyphs:\"▝▜██████▀\",from:2,to:7},{glyphs:\" ▝▝   ▝▝ \",from:0,to:0}],\"left-75\":[{glyphs:\"   ▛██▌  \",from:3,to:6},{glyphs:\"   ███▌  \",from:3,to:6},{glyphs:\"   ▘  ▘  \",from:0,to:0}],\"left-55\":[{glyphs:\"  ▐▜▛██  \",from:3,to:7},{glyphs:\"  ▐████  \",from:3,to:7},{glyphs:\"  ▝▝ ▝▝  \",from:0,to:0}],\"left-30\":[{glyphs:\"  ▛██▛█▌ \",from:2,to:7},{glyphs:\" ▝█████▛ \",from:2,to:7},{glyphs:\"  ▘▘  ▘▘ \",from:0,to:0}],\"left-12\":[{glyphs:\" ▐▛███▜█ \",from:2,to:8},{glyphs:\"▝▜██████▀\",from:2,to:7},{glyphs:\" ▝▝   ▝▝ \",from:0,to:0}]};",
+    "classic_three_line_art_search": {
+      "searched_for": [
+        "▐▛███▜▌",
+        "▝▜█████▛▘",
+        "▘▘ ▝▝"
+      ],
+      "forms_tried": [
+        "literal UTF-8",
+        "JS \\uXXXX escapes (upper case)"
+      ],
+      "binaries": [
+        "claude-1 (2.1.301)",
+        "claude-2 (2.1.296)",
+        "claude-3 (2.1.296)"
+      ],
+      "result": "absent in all three; this release composes the mascot from the segments above"
+    },
+    "offsets": {
+      "jo_definition": 214834640,
+      "component_aAe": 214838214,
+      "apple_terminal_fallback_wt": 214841114
+    },
+    "source_head": "var jo={default:{eyes:\"open\",arms:\"down\",feet:\"both\"},\"arms-up\":{eyes:\"open\",arms:\"up\",feet:\"both\"},\"look-left\":{eyes:\"left\",arms:\"down\",feet:\"both\"},\"look-right\":{eyes:\"right\",arms:\"down\",feet:\"both\"}},Xe={down:{r1L:\" \\u2590\",r1R:\"\",r2L:\"\\u259D\\u259C\",r2R:\"\\u2588\\u2580\"},up:{r1L:\"\\u2597\\u259F\",r1R:\"\\u2584\",r2L:\" \\u259C\",r2R:\"\\u2588\\u2598\"},\"one-up\":{r1L:\" \\u2590\",r1R:\"\\u2584\",r2L:\"\\u259D\\u259C\",r2R:\"\\u2588\\u2598\"}},Je={open:[{glyphs:\"\\u259B\\u2588\\u2588\\u2588\\u259B\\u2588\"}],left:[{glyphs:\"\\u259F\\u2588\\u2588\\u2588\\u",
+    "fallback_wt_summary": "Apple_Terminal fallback: row0 '▗' + ' ▗   ▖ ' (black on orange) + '▖'; row1 seven spaces on orange bg; row2 '▘▘   ▝▝'",
+    "official_grid_from_mark_png": {
+      "note": "The official sticker mark /clawd-ref/clawd-mark.png is 693x527 with a 58 px unit: 12 x 9 units (rows 0-7 used); body 8 wide (cols 2..9), eyes 1x1 black at cols 3 and 8 on row 1, arms 2x2 at cols 0-1 and 10-11 on rows 2-3, body rows 0-5, four 1x2 legs at cols 2,4,7,9 on rows 6-7. The block art above is this silhouette quantised to terminal cells."
+    }
+  }
+}

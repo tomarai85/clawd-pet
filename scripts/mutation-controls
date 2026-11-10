@@ -1,0 +1,1700 @@
+#!/usr/bin/python3
+"""Negative controls for the shell suites. For each control, in a COPY of the project (the tree is never mutated):
+
+  - the copy is a directory of symlinks to the tree, except the directory that holds the one file being mutated, which is a real
+    directory of symlinks with that one file replaced by a mutated copy; `.build` is shared so the helpers and the agent are found;
+  - the suite is run against the copy with the mutation applied; it must FAIL (non-zero exit, and its `FAIL` lines named below);
+  - the identity control (no mutation) must PASS, which proves the copy itself is faithful.
+
+Prints `NEGATIVE-CONTROL: <name> -> fails` for a control whose mutated copy failed the suite as expected. Logs go to
+<out>/run-<epoch>/<name>/ (default .evidence/r3/negative-controls/shell). Nothing is ever deleted. The lines it prints are also kept in
+<out>/run-<epoch>/summary.txt (with the commit and the date), so a run leaves its own evidence next to the per-control logs.
+Usage: scripts/mutation-controls [--out DIR] [--jobs N] [--group lsof|cli|attended|post|interrupt|update|all] [name ...]
+       scripts/mutation-controls --anchors [--group ...] [name ...]   (exit 1 when a row's anchor is no longer in its file; runs no suite)
+       --anchors covers every row unless names or --group are given; each row's edits are applied in order, each anchor must be found and
+       change the text, and an attended-menu row's anchor must be found exactly once.
+"""
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+repo = Path(__file__).resolve().parent.parent
+
+ATTENDED = ("scripts/attended-check.sh", ["bash", "Tests/attended-check.test.sh"], "attended")
+ATTENDED_COMMON = ("scripts/check-common.sh", ["bash", "Tests/attended-check.test.sh"], "attended")
+POST = ("scripts/post-install-check.sh", ["bash", "Tests/post-install-check.test.sh"], "post")
+POST_COMMON = ("scripts/check-common.sh", ["bash", "Tests/post-install-check.test.sh"], "post")
+SNAP = ("scripts/pre-install-snapshot.sh", ["bash", "Tests/post-install-check.test.sh"], "post")
+SHIM = ("Tests/interrupt-shims/op-shim", ["bash", "Tests/install-interrupt.test.sh"], "interrupt")
+LSOF = ("scripts/lsof-replay-check.sh", ["bash", "Tests/lsof-replay-check.test.sh"], "lsof")
+CLI = ("bin/clawd-pet", ["bash", "Tests/cli.test.sh"], "cli")
+CLI_TEST = ("Tests/cli.test.sh", ["bash", "Tests/cli.test.sh"], "cli")
+
+# name -> (target kind, [(before, after)], environment, FAIL-line substrings that must appear when mutated)
+CONTROLS = {
+    "cli-identity-control": (CLI, [], {}, None),
+    "lsof-verdict-ignores-counts": (LSOF, [(
+        '[ "$nonread" -eq 0 ] || { echo "FAIL: $nonread non-read-only descriptor(s) on Aqua paths seen in the samples"; ok=0; }\n'
+        '[ "$net" -eq 0 ] || { echo "FAIL: $net network descriptor(s) seen in the samples"; ok=0; }\n', "")], {},
+        ["FAIL lsof-nonread-sample-fails-the-verdict", "FAIL lsof-net-sample-fails-the-verdict"]),
+    "uninstall-signals-without-the-identity-recheck": (CLI, [(
+        '      signal_if_same TERM "$l"\n', '      set -- $l; kill -TERM "$2" 2>/dev/null\n')], {},
+        ["FAIL: 5b (absent): the listed pid was never signalled", "FAIL: 5b (restarted): the listed pid was never signalled"]),
+    "cli-children-not-pinned-to-bin-bash": (CLI_TEST, [(
+        'CLI_BASH="${CLAWD_TEST_BASH:-bash}"\n', 'CLI_BASH="bash"\n')], {"CLAWD_TEST_BASH": "/bin/bash"},
+        ["FAIL: pinned: every CLI process the stubs saw was /bin/bash"]),
+    # ---- r4 B: attended-check.sh, post-install-check.sh, pre-install-snapshot.sh, the logbase record, the interrupt handshake ----
+    #      (the rows are filled in below, after the table of the older controls)
+}
+
+# What each r4 B control must make the suite report as FAIL (substrings of the FAIL lines): the scenario that belongs to the mutated
+# rule has to be among the red ones, so a mutant that merely fails the suite for another reason (host load, a flaky wait) is NOT accepted.
+EXPECTED_FAILS = {
+    "attended-focus-violations-counter-ignored": ["focusViolations 2 at the start, no log line: fail codes"],
+    "attended-focus-violation-line-since-install-ignored": ["a FOCUS_VIOLATION line since install with a stale zero counter: fail codes"],
+    "attended-focus-violation-line-in-window-ignored": ["a FOCUS_VIOLATION line in the window while the install-time proof is unavailable: fail codes"],
+    # since Sprint 10 c1 an independent look that sees the agent is a FAIL of its own, and the stub's `front` moves the system's answer too,
+    # so any look can see it; this scenario moves only the sampler's value, so no look can
+    "attended-agent-frontmost-ignored": ["the sampler alone names the agent's pid in one sample: verdict FAIL"],
+    "attended-sampling-stops-with-the-window": ["the agent is frontmost 800 ms after the last INPUT line: fail codes"],
+    "attended-history-proved-by-size-only": ["agent.log.1 has its recorded size and different content: the install-time proof is not available"],
+    "attended-history-log-prefix-hash-ignored": ["the first recorded bytes of agent.log differ (same size): the install-time proof is not available"],
+    "attended-since-install-offset-not-applied": ["retained logs: the since-install offset is the recorded size of agent.log"],
+    "attended-pid-change-ignored": ["the agent's pid differs between the start and the end: not-run codes"],
+    "attended-frontmost-read-failure-ignored": ["one frontmost sample cannot be read: not-run codes"],
+    "attended-sampler-gap-ignored": ["a 51 ms gap between samples: not-run codes"],
+    "attended-sampler-gap-limit-off-by-one": ["a gap of exactly 50 ms is allowed: not-run codes"],
+    "attended-frontmost-change-ignored": ["the frontmost app changes to another app: not-run codes"],
+    "attended-display-change-ignored": ["displayChangeCount changes during the window: not-run codes"],
+    "attended-rotation-in-window-ignored": ["rotation: the evidence says so"],
+    "attended-mouse-down-minimum-ignored": ["two mouseDown only: not-run codes"],
+    # with no input in the window the window read is skipped (end offset = start offset), so the retained-logs scenario is the one with
+    # old lines before the window and lines in it
+    "attended-input-counted-from-the-start-of-the-file": ["retained logs: only the window's own 3 mouseDown count (the old INPUT line does not)"],
+    "attended-drag-sequence-not-required": ["three clicks, no drag line, and the panel moved: not-run codes"],
+    "attended-drag-sequence-order-not-enforced": ["a drag and an up that come before any down: not-run codes"],
+    "attended-panel-origin-move-not-required": ["a jiggle: down, drag, up and an unchanged panel origin, state.json changed: not-run codes"],
+    "attended-panel-move-threshold-too-low": ["the panel's origin moved 2.9 pt: not-run codes"],
+    "attended-panel-move-decided-on-the-rounded-figure": ["the origin moved 2.1 pt on each axis (2.97 pt in all): not-run codes"],
+    "attended-panel-size-change-ignored": ["the stage window's size differs between the reads, also at every re-read: not-run codes"],
+    "attended-panel-size-not-re-read": ["the size differs at first and is equal at the re-read within the grace: verdict PASS"],
+    "attended-panel-missing-at-the-start-ignored": ["no on-screen window of the agent at the start: not-run codes"],
+    "attended-window-lister-failure-ignored": ["the window lister fails at the start: not-run codes"],
+    "attended-sampler-start-failure-ignored": ["the sampler exits at once: not-run codes"],
+    "attended-sampler-silence-at-the-end-ignored": ["sampler_still_producing: no sampler job at all is not producing"],
+    "attended-status-unreadable-ignored": ["no status.json: not-run codes"],
+    "attended-not-installed-not-checked": ["no manifest: not-run codes"],
+    "attended-not-loaded-not-checked": ["launchctl does not list the label: not-run codes"],
+    "attended-signal-trap-removed": ["TERM: the receipt says NOT RUN with the reason interrupted"],
+    "attended-scope-sentence-dropped": ["baseline: the evidence names its scope"],
+    "attended-real-flag-not-required": ["no --real outside a sandbox: exit 64"],
+    "attended-real-flag-accepted-in-a-sandbox": ["the real-mode flag inside a sandbox run: exit 64"],
+    "check-common-seams-accepted-outside-a-sandbox": ["resolve_mode refuses CLAWD_LAUNCHCTL outside a sandbox with 64"],
+    "check-common-sandbox-outside-build-accepted": ["a sandbox outside .build: exit 64"],
+    "post-agent-death-not-a-failure": ["the agent has no process after the wait: fail codes"],
+    "post-agent-restart-not-a-failure": ["the pid changed within the wait: fail codes"],
+    "post-missing-panel-not-a-failure": ["Aqua Voice runs and the agent has no on-screen window: fail codes"],
+    "post-panel-owner-pid-ignored": ["an on-screen window of another pid is not the panel: fail codes"],
+    "post-hidden-pet-without-aqua-counts-as-missing": ["no panel because Aqua Voice is not running: not-run codes"],
+    "post-lister-failure-ignored": ["the window list cannot be read for check (a): not-run codes"],
+    "post-not-installed-not-checked": ["no manifest: not-run codes"],
+    "post-not-loaded-not-checked": ["launchctl does not list the label: not-run codes"],
+    "post-signal-trap-removed": ["interrupt: NOT RUN with the reason interrupted"],
+    "post-real-flag-accepted-in-a-sandbox": ["post: the real-mode flag inside a fully stubbed sandbox run: exit 64"],
+    "snapshot-retained-logs-are-compared": ["compare: a retained log whose content grew is not a difference"],
+    "snapshot-root-with-only-logs-is-not-absent": ["equals an absent one"],
+    "snapshot-compare-always-equal": ["compare: an installed tree differs from the clean listing (exit 1)"],
+    "snapshot-label-state-not-read": ["snapshot: a loaded label is listed"],
+    "snapshot-file-contents-not-recorded": ["snapshot: a file is listed with its size and sha256"],
+    "logbase-lines-not-written": ["manifest records logbase absent for both logs"],
+    "logbase-hash-not-recorded": ["the third install records both logs by size and sha256"],
+    "logbase-unreadable-log-does-not-refuse": ["an unreadable retained log refuses the install before anything is created (exit 2)"],
+    "interrupt-handshake-replaced-by-a-fixed-wait": ["signal(TERM): the installer exits nonzero (143)"],
+    "interrupt-handshake-timeout-passes": ["shim handshake: no release within the bound: exit 125"],
+}
+
+# ---- r4 B rows. Each mutates ONE rule of a script (or of the logbase record, or of the interrupt handshake) and the whole suite of that
+#      script must go red on the named lines. The "-identity" rows prove the copy itself is faithful. ----
+ATT = "attended-"
+CONTROLS.update({
+    "attended-identity-control": (ATTENDED, [], {}, None),
+    "post-identity-control": (POST, [], {}, None),
+    "interrupt-identity-control-with-3-s-signal-delay": (SHIM, [], {"CLAWD_TEST_SIGNAL_DELAY": "3"}, None),
+
+    # -- FAIL rows of B.2 --
+    "attended-focus-violations-counter-ignored": (ATTENDED, [
+        ('  if [ -n "$STATUS_FV0" ] && [ "$STATUS_FV0" -gt 0 ]; then fail', '  if false; then fail'),
+        ('  if [ -n "$STATUS_FV1" ] && [ "$STATUS_FV1" -gt 0 ]; then fail', '  if false; then fail')], {}, []),
+    "attended-focus-violation-line-since-install-ignored": (ATTENDED, [
+        ('  if [ "$LOGS_SCANNED" = 1 ] && [ "$FV_RETAINED" -gt 0 ]; then fail', '  if false; then fail')], {}, []),
+    "attended-focus-violation-line-in-window-ignored": (ATTENDED, [
+        ('  if [ "$LOGS_SCANNED" = 1 ] && [ "$FV_RETAINED" -gt 0 ]; then fail', '  if false; then fail')], {}, []),
+    "attended-agent-frontmost-ignored": (ATTENDED, [
+        ('  if [ -n "$S_AGENT" ] && [ "$S_AGENT" -gt 0 ]; then fail', '  if false; then fail')], {}, []),
+    "attended-sampling-stops-with-the-window": (ATTENDED, [
+        ('QUIET_AFTER_INPUT_MS=1000', 'QUIET_AFTER_INPUT_MS=0')], {}, []),
+
+    # -- NOT RUN rows of B.2: the since-install history --
+    "attended-history-proved-by-size-only": (ATTENDED, [
+        ('    if [ "$size" != "$bytes" ] || [ "$(prefix_hash "$LOG1" "$bytes")" != "$hash" ]; then', '    if [ "$size" != "$bytes" ]; then')], {}, []),
+    "attended-history-log-prefix-hash-ignored": (ATTENDED, [
+        ('    if [ "$size" -lt "$bytes" ] || [ "$(prefix_hash "$LOG" "$bytes")" != "$hash" ]; then', '    if [ "$size" -lt "$bytes" ]; then')], {}, []),
+    "attended-since-install-offset-not-applied": (ATTENDED, [
+        ('    HIST_OFFSET="$bytes"\n', '    HIST_OFFSET=0\n')], {}, []),
+
+    # -- NOT RUN rows of B.2: the window --
+    "attended-pid-change-ignored": (ATTENDED, [
+        ('  if [ -n "$P1" ] && [ "$P1" != "$P0" ]; then notrun', '  if false; then notrun'),
+        ('  if [ -z "$P1" ]; then notrun agent-pid-changed', '  if false; then notrun agent-pid-changed')], {}, []),
+    "attended-frontmost-read-failure-ignored": (ATTENDED, [
+        ('    if [ "$S_UNREAD" -gt 0 ]; then notrun', '    if false; then notrun')], {}, []),
+    "attended-sampler-gap-ignored": (ATTENDED, [
+        ('    if [ "$S_COUNT" -gt 1 ] && [ "$S_MAXGAP" -gt "$MAX_GAP_MS" ]; then notrun', '    if false; then notrun')], {}, []),
+    "attended-sampler-gap-limit-off-by-one": (ATTENDED, [
+        ('[ "$S_MAXGAP" -gt "$MAX_GAP_MS" ]', '[ "$S_MAXGAP" -ge "$MAX_GAP_MS" ]')], {}, []),
+    "attended-frontmost-change-ignored": (ATTENDED, [
+        ('    if [ "$S_CHANGES" -gt 0 ]; then notrun', '    if false; then notrun')], {}, []),
+    "attended-display-change-ignored": (ATTENDED, [
+        ('  if [ -n "$STATUS_DC0" ] && [ -n "$STATUS_DC1" ] && [ "$STATUS_DC0" != "$STATUS_DC1" ]; then', '  if false; then')], {}, []),
+    "attended-rotation-in-window-ignored": (ATTENDED, [
+        ('  if { [ "$LOG_I0" != none ] && { [ "$LOG_I1" != "$LOG_I0" ] || [ "$ROT_NOW_I" != "$LOG_I0" ]; }; } || [ "$LOG_S1" -lt "$LOG_S0" ] || [ "$LOG1_SIG1" != "$LOG1_SIG0" ] || [ "$ROT_NOW_L1" != "$LOG1_SIG0" ]; then', '  if false; then')], {}, []),
+    "attended-mouse-down-minimum-ignored": (ATTENDED, [
+        ('  if [ "$IN_DOWN" -lt "$MIN_MOUSE_DOWNS" ]; then notrun', '  if false; then notrun')], {}, []),
+    "attended-input-counted-from-the-start-of-the-file": (ATTENDED, [
+        ('    tail -c +"$((LOG_S0 + 1))" "$LOG" 2>/dev/null | head -c "$((LOG_S1 - LOG_S0))" | /usr/bin/awk \'$2 == "INPUT"\' >> "$WINDOW_LINES_FILE"',
+         '    head -c "$LOG_S1" "$LOG" 2>/dev/null | /usr/bin/awk \'$2 == "INPUT"\' >> "$WINDOW_LINES_FILE"')], {}, []),
+    "attended-drag-sequence-not-required": (ATTENDED, [
+        ('  if [ "$IN_SEQ" != 1 ]; then notrun', '  if false; then notrun')], {}, []),
+    "attended-drag-sequence-order-not-enforced": (ATTENDED, [
+        ('$2 == "INPUT" && $3 == "kind=mouseDragged" { drag++; if (state == 1) state = 2 }', '$2 == "INPUT" && $3 == "kind=mouseDragged" { drag++; state = 2 }')], {}, []),
+    "attended-panel-origin-move-not-required": (ATTENDED, [
+        ('    elif [ "$PANEL_MOVED_OK" != 1 ]; then', '    elif false; then')], {}, []),
+    "attended-panel-move-threshold-too-low": (ATTENDED, [
+        ('MIN_MOVE_PT=3', 'MIN_MOVE_PT=2')], {}, []),
+    "attended-panel-move-decided-on-the-rounded-figure": (ATTENDED, [
+        ('(d >= min) ? 1 : 0', '(sprintf("%.1f", d) + 0 >= min) ? 1 : 0')], {}, []),
+    "attended-panel-size-change-ignored": (ATTENDED, [
+        ('    if [ "$PANEL_SIZE_EQUAL" = 0 ]; then', '    if false; then')], {}, []),
+    "attended-panel-size-not-re-read": (ATTENDED, [
+        ('    tries=$((tries + 1))\n    [ "$tries" -le "$GRACE_RE_READS" ] || break\n    sleep 0.1\n    fresh_look end-read\n    sleep 0.1\n', '    break\n')], {}, []),
+    "attended-panel-missing-at-the-start-ignored": (ATTENDED, [
+        ('  [ -n "$panel" ] || return 3\n', '  [ -n "$panel" ] || { printf "0 0 0 0 0"; return 0; }\n')], {}, []),
+    "attended-window-lister-failure-ignored": (ATTENDED, [
+        ('  lines="$(ck_windows "$SAMPLER")" || return 2\n', '  lines="$(ck_windows "$SAMPLER")" || lines=""\n')], {}, []),
+    "attended-sampler-start-failure-ignored": (ATTENDED, [
+        ('  if [ "$(sample_stamp)" = 0 ]; then notrun sampler-failed', '  if false; then notrun sampler-failed')], {}, []),
+    "attended-sampler-silence-at-the-end-ignored": (ATTENDED, [
+        ('  sampler_alive && [ "$(sample_stamp)" -gt "$before" ]\n', '  true\n')], {}, []),
+    "attended-status-unreadable-ignored": (ATTENDED, [
+        ('  if ! read_status 0; then notrun status-unreadable "status.json is missing or lacks focusViolations / displayChangeCount"; return 1; fi', '  read_status 0 || true'),
+        ('  if ! read_status 0; then notrun status-unreadable "status.json could not be read at the start of the window"; return 1; fi', '  read_status 0 || true'),
+        ('  read_status 1 || notrun status-unreadable "status.json could not be read at the end of the window"', '  read_status 1 || true')], {}, []),
+    "attended-not-installed-not-checked": (ATTENDED, [
+        ('  if [ ! -f "$MANIFEST" ] || [ ! -f "$PLIST" ]; then', '  if false; then')], {}, []),
+    "attended-not-loaded-not-checked": (ATTENDED, [
+        ('  if ! read_agent; then notrun not-loaded "launchctl does not list $LABEL: run \'clawd-pet start\' first"; return 1; fi', '  read_agent || true'),
+        ('  if [ -z "$P0" ]; then notrun not-loaded "$LABEL is loaded but has no running process"; return 1; fi', '  :')], {}, []),
+    "attended-signal-trap-removed": (ATTENDED, [
+        ('  trap on_signal INT TERM HUP\n', '')], {}, []),
+    "attended-scope-sentence-dropped": (ATTENDED, [
+        (' External observation of the key window is not claimed."', '"')], {}, []),
+
+    # -- the real-mode gates (every mutation here still runs only in stubbed sandboxes or empty fake HOMEs) --
+    "attended-real-flag-not-required": (ATTENDED, [
+        ('    if [ "$real" != 1 ]; then\n      ck_warn "attended-check: refused (64): real mode needs', '    if false; then\n      ck_warn "attended-check: refused (64): real mode needs')], {}, []),
+    "attended-real-flag-accepted-in-a-sandbox": (ATTENDED, [
+        ('  elif [ "$real" = 1 ]; then', '  elif false; then')], {}, []),
+    "check-common-seams-accepted-outside-a-sandbox": (ATTENDED_COMMON, [
+        ('      if [ -n "${!v:-}" ]; then', '      if false; then')], {}, []),
+    "check-common-sandbox-outside-build-accepted": (ATTENDED_COMMON, [
+        ('  case "$CK_SANDBOX" in "$phys"/*) ;; *) ck_warn', '  case "$CK_SANDBOX" in *) ;; *) ck_warn')], {}, []),
+
+    # -- post-install-check.sh --
+    "post-agent-death-not-a-failure": (POST, [
+        ('  if [ -z "$P1" ]; then fail agent-not-alive-after-5s', '  if false; then fail agent-not-alive-after-5s')], {}, []),
+    "post-agent-restart-not-a-failure": (POST, [
+        ('  if [ "$P1" != "$P0" ]; then fail agent-restarted', '  if false; then fail agent-restarted')], {}, []),
+    "post-missing-panel-not-a-failure": (POST, [
+        ('  if [ -z "$PANEL" ]; then\n    if aqua_running; then', '  if false; then\n    if aqua_running; then')], {}, []),
+    "post-panel-owner-pid-ignored": (POST_COMMON, [
+        ('    $1 == "WINDOW" && $2 == pid && $4 == 1 {', '    $1 == "WINDOW" && $4 == 1 {')], {}, []),
+    "post-hidden-pet-without-aqua-counts-as-missing": (POST, [
+        ('    if aqua_running; then AQUA_RUNNING=1;', '    if true; then AQUA_RUNNING=1;')], {}, []),
+    "post-lister-failure-ignored": (POST, [
+        ('  if [ "$rc" -ne 0 ]; then notrun window-lister-failed "the window list could not be read"; return 0; fi', '  :')], {}, []),
+    "post-not-installed-not-checked": (POST, [
+        ('  if [ ! -f "$MANIFEST" ] || [ ! -f "$PLIST" ]; then', '  if false; then')], {}, []),
+    "post-not-loaded-not-checked": (POST, [
+        ('  if ! read_agent; then notrun not-loaded "launchctl does not list $LABEL: the pet has not been started"; return 1; fi', '  read_agent || true'),
+        ('  if [ -z "$P0" ]; then notrun not-loaded "$LABEL is loaded but has no running process"; return 1; fi', '  :')], {}, []),
+    "post-signal-trap-removed": (POST, [
+        ('  trap on_signal INT TERM HUP\n', '')], {}, []),
+    "post-real-flag-accepted-in-a-sandbox": (POST, [
+        ('  elif [ "$real" = 1 ]; then', '  elif false; then')], {}, []),
+
+    # -- pre-install-snapshot.sh --
+    "snapshot-retained-logs-are-compared": (SNAP, [
+        ('        if (index(l, "file: " root "/agent.log ") == 1 || index(l, "file: " root "/agent.log.1 ") == 1) continue\n', '')], {}, []),
+    "snapshot-root-with-only-logs-is-not-absent": (SNAP, [
+        ('if (keep[i] == "dir: " root && others == 0) print "absent: " root', 'if (0) print "absent: " root')], {}, []),
+    "snapshot-compare-always-equal": (SNAP, [
+        ('    if diff "$saved_body" "$now_body" > "$now_body.diff"; then', '    if true; then')], {}, []),
+    "snapshot-label-state-not-read": (SNAP, [
+        ('  if "$LAUNCHCTL" list "$LABEL" >/dev/null 2>&1; then echo "label: loaded"; else echo "label: not loaded"; fi', '  echo "label: not loaded"')], {}, []),
+    "snapshot-file-contents-not-recorded": (SNAP, [
+        ('    printf \'file: %s %s %s\\n\' "$e" "$size" "${hash:-unreadable}"', '    printf \'file: %s\\n\' "$e"')], {}, []),
+
+    # -- the logbase record written by install (checked by Tests/cli.test.sh) --
+    "logbase-lines-not-written": (CLI, [
+        ('    printf \'%s\\n\' "$logbase_agent" "$logbase_older"\n', '')], {}, []),
+    "logbase-hash-not-recorded": (CLI, [
+        ('  hash="$(/usr/bin/shasum -a 256 < "$path")" || return 1\n  hash="${hash%% *}"\n', '  hash="0000000000000000000000000000000000000000000000000000000000000000"\n')], {}, []),
+    "logbase-unreadable-log-does-not-refuse": (CLI, [
+        ('  logbase_agent="$(logbase_line "$ROOT/agent.log")" || die "cannot read $ROOT/agent.log to record its state"', '  logbase_agent="$(logbase_line "$ROOT/agent.log")" || logbase_agent="logbase $ROOT/agent.log absent"')], {}, []),
+
+    # -- B.6: the interrupt tests no longer depend on a fixed window --
+    "interrupt-handshake-replaced-by-a-fixed-wait": (SHIM, [
+        ('  while [ ! -e "$OPSHIM_WAIT_RELEASE" ]; do', '  sleep 2\n  while false; do')], {"CLAWD_TEST_SIGNAL_DELAY": "3"}, []),
+    "interrupt-handshake-timeout-passes": (SHIM, [
+        ('      exit 125\n', '      exit 0\n')], {}, []),
+})
+
+
+# ---- Sprint 4a rows: async bootout, the launcher, the settings writer, and the round 4 carry-over (attended, post, direct exec, settings step) ----
+# The "-fast" rows run only the part of Tests/cli.test.sh that holds the rule (CLAWD_TEST_STOP_AFTER), so a row costs about a minute.
+CLI_FAST_ENV = {"CLAWD_TEST_STOP_AFTER": "3f"}
+CLI_5E_ENV = {"CLAWD_TEST_STOP_AFTER": "5e"}
+INTERRUPT_CLI = ("bin/clawd-pet", ["bash", "Tests/install-interrupt.test.sh"], "interrupt")
+LAUNCHER_SRC = ("launcher/launcher.c", ["bash", "Tests/cli.test.sh"], "cli")
+PLIST_TEMPLATE = ("launchd/com.tomtim.clawd-pet.plist.in", ["bash", "Tests/cli.test.sh"], "cli")
+BUILD_LAUNCHER = ("scripts/build-launcher", ["bash", "Tests/cli.test.sh"], "cli")
+DIRECT_EXEC = ("scripts/direct-exec-check.sh", ["bash", "Tests/post-install-check.test.sh"], "post")
+DIRECT_EXEC_OBSERVE = ("scripts/direct-exec-observe.pl", ["bash", "Tests/post-install-check.test.sh"], "post")
+SETTINGS_STEP = ("scripts/post-install-settings-step.sh", ["bash", "Tests/post-install-check.test.sh"], "post")
+
+EXPECTED_FAILS.update({
+    # -- item 2: async bootout
+    "stop-without-the-bootout-wait": ["stop waits for a bootout that completes after 3 polls: exit 0"],
+    "bootout-wait-shortened-to-5-s": ["with exactly 101 looks at the label after the bootout"],
+    "uninstall-without-the-bootout-wait": ["5e: uninstall succeeds when the label stays listed for 3 polls after bootout"],
+    # -- item 1: the launcher
+    "plist-template-names-the-agent": ["plist ProgramArguments names the installed launcher"],
+    "install-skips-the-launcher-sha-check-before-it-starts": ["... and created nothing (no ROOT, no marker, no plist, no CLI)"],
+    "install-does-not-verify-the-launcher-copy": ["a launcher copy spoiled after a successful cp: install exits 2"],
+    "install-does-not-copy-the-launcher": ["installed launcher is executable and byte-identical to the checked-in launcher"],
+    "manifest-omits-the-launcher": ["manifest lists the launcher and its .partial name"],
+    "uninstall-skips-the-launcher": ["launcher scenario: uninstall exits 0"],
+    "launcher-forks-instead-of-exec": ["a fresh build of launcher.c passes the launch guard through the whole path"],
+    "launcher-keeps-the-old-argv0": ["scratch build: the agent ran as the launcher's own pid, with argv[0] = the agent's path"],
+    "launcher-exits-1-on-failure": ["scratch build: exits 111 with no agent beside it"],
+    "build-launcher-rebuilds-over-a-checked-in-launcher": ["build-launcher refuses to build over a checked-in launcher (exit 2)"],
+    "build-launcher-records-the-wrong-sha": ["build-launcher records the sha256 of what it built"],
+    # -- item 4: the settings writer
+    "settings-writer-without-the-lock": ["forced order: B is still waiting 1.2 s after it started (it has not taken the lock)", "the race: all 200 iterations"],
+    "settings-writer-gives-up-the-lock-wait-and-writes": ["lock wait: B gives up with exit 2 when the lock stays held"],
+    "settings-writer-replaces-in-place": ["control.json was replaced by a rename (a new inode)"],
+    "settings-generation-not-raised": ["walk off raised generation by exactly 1"],
+    "settings-writer-creates-the-lock-file": ["a writer never creates the lock file"],
+    "settings-invalid-input-writes-anyway": ["invalid 'walk maybe' left control.json byte-identical"],
+    "settings-no-wait-for-the-agent": ["not applied within 2 s: exit 3"],
+    "settings-wait-shortened-to-500-ms": ["applied after 1.2 s: still exit 0, and it waited for it"],
+    "settings-any-appliedgeneration-confirms": ["appliedGeneration below the written generation is not a confirmation (exit 3)"],
+    "settings-unconfirmed-exits-2": ["not applied within 2 s: exit 3"],
+    "settings-last-bubble-style-can-be-excluded": ["excluding the last of styles 1-12 is refused (exit 2)"],
+    "settings-waits-for-an-agent-that-is-not-running": ["walk off with the agent not running exits 0"],
+    "install-does-not-create-the-lock-file": ["control.lock exists, is a regular empty file, and control.json starts at generation 0"],
+    # -- item 3: attended-check
+    "attended-input-window-opens-before-the-sampler": ["a drag and three clicks logged before the first sample: verdict NOT RUN"],
+    "attended-input-window-has-no-end": ["a third click logged after the end offset was frozen: verdict NOT RUN"],
+    "attended-end-facts-read-after-the-sampler-stops": ["window facts: the sampler kept producing for at least 100 ms after the end facts were frozen"],
+    "attended-rotated-file-not-read": ["a FOCUS_VIOLATION recorded, then agent.log rotated before the end: verdict FAIL"],
+    "attended-new-log-read-from-the-old-offset": ["violation in a shorter new file: counted in the window"],
+    "attended-rotated-file-read-from-its-first-byte": ["a retained violation in the file that is rotated away: verdict NOT RUN"],
+    "attended-violation-count-stops-at-the-window-end": ["violation after the frozen end: counted in the window's violation count (not only in the history)"],
+    "attended-freshness-ignored-at-the-start": ["the sampler disagrees with the system only at the start of the window: verdict NOT RUN"],
+    "attended-freshness-ignored-at-the-end": ["the sampler keeps its old frontmost pid after the system's changed: verdict NOT RUN"],
+    "attended-unreadable-system-front-passes": ["lsappinfo gives no answer: verdict NOT RUN"],
+    "attended-hup-not-trapped": ["HUP: the receipt says NOT RUN with the reason interrupted"],
+    # -- item 3: post-install-check (read-only) and the direct-exec step
+    "post-runs-the-installed-launcher": ["pass: strictly read-only: nothing from the install was run (the stand-in agent never started)", "post: STRICTLY READ-ONLY: no line runs the installed agent or the installed launcher"],
+    "post-launcher-hash-not-compared": ["the installed launcher differs from the recorded one by one byte: verdict FAIL"],
+    "post-plist-program-not-checked": ["the plist names the agent, as a v1 install did: verdict FAIL"],
+    "post-launcher-symlink-accepted": ["the installed launcher is a symlink to the right bytes: verdict FAIL"],
+    "dx-reads-outside-the-life-count-as-observation": ["a copy that exits before one read fits in its life: verdict NOT RUN"],
+    "dx-no-read-inside-the-life-passes": ["a copy that exits before one read fits in its life: verdict NOT RUN"],
+    "dx-one-failed-read-is-tolerated": ["one failed read among good ones: verdict NOT RUN"],
+    "dx-gap-between-reads-not-checked": ["a gap between the exec and the first read (and between reads) above the allowed 0 ms: verdict NOT RUN"],
+    "dx-runs-the-installed-agent-itself": ["a copy that lives 0.3 s, exits 0 and shows no window, observed throughout: the installed agent was never run"],
+    "dx-copy-not-compared-with-the-installed-agent": ["a copy that is not byte-identical to the installed agent: verdict FAIL"],
+    "dx-exit-code-ignored": ["the copy exits 3: verdict FAIL"],
+    "dx-window-ignored": ["the copy registers a window of its own pid: verdict FAIL"],
+    # the direct exec moved out of post-install-check.sh in S4a; these two replace post-direct-exec-* rows whose anchors were left behind
+    # (exit code, window and lister failure are dx-exit-code-ignored, dx-window-ignored and dx-one-failed-read-is-tolerated); the time limit
+    # has two branches: the observer's LIMIT line, and the elapsed time of a copy reaped after the limit without one
+    "dx-limit-hit-ignored": ["the copy is still running at the limit: fail codes [direct-exec-too-slow]"],
+    "dx-elapsed-time-ignored": ["the copy exits 0 inside a read that ends past the limit: fail codes [direct-exec-too-slow]"],
+    "dx-agent-not-executable-ignored": ["the installed agent is not executable: verdict NOT RUN"],
+    "dx-gate-not-required": ["dx: --real without --run-a-copy: exit 64"],
+    "dx-observer-never-stops-a-slow-copy": ["slow: the limit is recorded as hit"],
+    # -- item 3: the settings step
+    "ss-applied-generation-not-checked": ["the CLI exits 0 but the agent never reported the generation: verdict FAIL"],
+    "ss-second-change-not-made": ["walking on at the start: off, then on: verdict PASS"],
+    "ss-agent-pid-not-compared": ["the agent's pid changes during the first change: verdict FAIL"],
+    "ss-log-order-not-checked": ["the WALK line comes before the SETTINGS line: verdict FAIL"],
+    "ss-gate-not-required": ["ss: --real without --change-a-setting: exit 64"],
+    "ss-interrupt-leaves-the-setting-flipped": ["interrupt: the setting was put back (walk true, as it was)"],
+})
+
+CONTROLS.update({
+    "cli-fast-identity-control": (CLI, [], CLI_FAST_ENV, None),
+    "cli-5e-identity-control": (CLI, [], CLI_5E_ENV, None),
+
+    # -- item 2: async bootout
+    "stop-without-the-bootout-wait": (CLI, [
+        ('  wait_unloaded || die "launchctl bootout failed; the service is still loaded after 10 s"',
+         '  if is_loaded; then die "launchctl bootout failed; the service is still loaded after 10 s"; fi')], CLI_FAST_ENV, []),
+    "bootout-wait-shortened-to-5-s": (CLI, [('UNLOAD_WAIT_STEPS=100', 'UNLOAD_WAIT_STEPS=50')], CLI_FAST_ENV, []),
+    "a-failed-list-counts-as-unloaded": (CLI, [
+        ('  case $? in 0) echo loaded ;; 113) echo unloaded ;; *) echo unknown ;; esac',
+         '  case $? in 0) echo loaded ;; *) echo unloaded ;; esac')], CLI_FAST_ENV,
+        ["uninstall refuses (exit 2) while launchctl cannot say whether the job is loaded"]),
+    "uninstall-without-the-bootout-wait": (CLI, [
+        ('  wait_unloaded || die "LaunchAgent is still loaded 10 s after bootout; files retained"',
+         '  if is_loaded; then die "LaunchAgent is still loaded 10 s after bootout; files retained"; fi')], CLI_5E_ENV, []),
+
+    # -- item 1: the launcher
+    "plist-template-names-the-agent": (PLIST_TEMPLATE, [('@INSTALL_ROOT@/bin/clawd-pet-launch</string>', '@INSTALL_ROOT@/bin/clawd-pet-agent</string>')], CLI_FAST_ENV, []),
+    "install-skips-the-launcher-sha-check-before-it-starts": (CLI, [
+        ('  [ "$(sha256_of "$launcher_src")" = "$launcher_sha" ] || die "launcher/clawd-pet-launch does not match launcher/clawd-pet-launch.sha256; $tail"\n', '')], CLI_FAST_ENV, []),
+    "install-does-not-verify-the-launcher-copy": (INTERRUPT_CLI, [
+        ('  if [ -n "${3:-}" ] && [ "$(sha256_of "$2.partial")" != "$3" ]; then die "the copy $2.partial does not match the recorded sha256 of its source"; fi\n', '')], {}, []),
+    "install-does-not-copy-the-launcher": (CLI, [
+        ('      "$LAUNCHER") copy_executable "${sources[$i]}" "${files[$i]}" "$launcher_sha" ;;', '      "$LAUNCHER") : ;;')], CLI_FAST_ENV, []),
+    "manifest-omits-the-launcher": (CLI, [
+        ('    for f in "${files[@]}" "${reserved[@]}" "${partials[@]}" "$MARKER"; do echo "file $f"; done',
+         '    for f in "${files[@]}" "${reserved[@]}" "${partials[@]}" "$MARKER"; do [ "$f" = "$LAUNCHER" ] && continue; echo "file $f"; done')], CLI_FAST_ENV, []),
+    "uninstall-skips-the-launcher": (CLI, [
+        ('    [ "$f" = "$MARKER" ] && continue\n    if [ -e "$f" ]; then\n      [ -f "$f" ] || die "manifest entry is not a regular file: $f"',
+         '    [ "$f" = "$MARKER" ] && continue\n    [ "$f" = "$LAUNCHER" ] && continue\n    if [ -e "$f" ]; then\n      [ -f "$f" ] || die "manifest entry is not a regular file: $f"')], CLI_FAST_ENV, []),
+    "launcher-forks-instead-of-exec": (LAUNCHER_SRC, [
+        ('#include <unistd.h>\n', '#include <unistd.h>\n#include <sys/wait.h>\n'),
+        ('    execv(agent, argv);\n    _exit(111);', '    pid_t child = fork();\n    if (child == 0) { execv(agent, argv); _exit(111); }\n    int status;\n    waitpid(child, &status, 0);\n    _exit(0);')], CLI_FAST_ENV, []),
+    "launcher-keeps-the-old-argv0": (LAUNCHER_SRC, [('    argv[0] = agent;\n', '')], CLI_FAST_ENV, []),
+    "launcher-exits-1-on-failure": (LAUNCHER_SRC, [('    execv(agent, argv);\n    _exit(111);', '    execv(agent, argv);\n    _exit(1);')], CLI_FAST_ENV, []),
+    "build-launcher-rebuilds-over-a-checked-in-launcher": (BUILD_LAUNCHER, [
+        ('if [ "$mode" = build ] && { [ -e "$out" ] || [ -e "$record" ]; }; then', 'if false; then')], CLI_FAST_ENV, []),
+    "build-launcher-records-the-wrong-sha": (BUILD_LAUNCHER, [
+        ("printf '%s  clawd-pet-launch\\n' \"$sha\" > \"$record.new\"", "printf '%s  clawd-pet-launch\\n' 0000000000000000000000000000000000000000000000000000000000000000 > \"$record.new\"")], CLI_FAST_ENV, []),
+
+    # -- item 4: the settings writer
+    "settings-writer-without-the-lock": (CLI, [('  lock_descriptor 9 "$CONTROL_LOCK_WAIT_S"\n', '  true\n')], CLI_FAST_ENV, []),
+    "settings-writer-gives-up-the-lock-wait-and-writes": (CLI, [
+        ('    75) die "another settings change holds $CONTROL_LOCK for more than $CONTROL_LOCK_WAIT_S s; nothing was changed" ;;', '    75) : ;;')], CLI_FAST_ENV, []),
+    "settings-writer-replaces-in-place": (CLI, [
+        ('  mv -f "$CONTROL_PARTIAL" "$CONTROL" || { rm -f -- "$CONTROL_PARTIAL"; die "could not replace control.json"; }',
+         '  { cat "$CONTROL_PARTIAL" > "$CONTROL" && rm -f -- "$CONTROL_PARTIAL"; } || die "could not replace control.json"')], CLI_FAST_ENV, []),
+    "settings-generation-not-raised": (CLI, [('  gen=$((gen + 1))\n  /usr/bin/plutil -convert', '  gen=$((gen + 0))\n  /usr/bin/plutil -convert')], CLI_FAST_ENV, []),
+    "settings-writer-creates-the-lock-file": (CLI, [
+        ('  [ -f "$CONTROL_LOCK" ] && [ ! -L "$CONTROL_LOCK" ] || die "$CONTROL_LOCK is missing: this install has no settings lock; run scripts/uninstall and scripts/install from the repo"',
+         '  [ -f "$CONTROL_LOCK" ] || : > "$CONTROL_LOCK"')], CLI_FAST_ENV, []),
+    "settings-invalid-input-writes-anyway": (CLI, [('    *) die "walk must be on or off" ;;', '    *) change_setting "walk $1" walk bool false ;;')], CLI_FAST_ENV, []),
+    "settings-no-wait-for-the-agent": (CLI, [('  start="$(now_ms)"\n  while :; do', '  return 0\n  start="$(now_ms)"\n  while :; do')], CLI_FAST_ENV, []),
+    "settings-wait-shortened-to-500-ms": (CLI, [('APPLY_WAIT_MS=2000', 'APPLY_WAIT_MS=500')], CLI_FAST_ENV, []),
+    "settings-any-appliedgeneration-confirms": (CLI, [('  [ "$applied" -ge "$1" ]\n', '  [ "$applied" -ge 0 ]\n')], CLI_FAST_ENV, []),
+    "settings-unconfirmed-exits-2": (CLI, [('did not confirm it within 2 s" >&2\n  return 3', 'did not confirm it within 2 s" >&2\n  return 2')], CLI_FAST_ENV, []),
+    "settings-last-bubble-style-can-be-excluded": (CLI, [
+        ('        if [ "$n" -le 12 ] && [ "$(printf \'%s\\n\' "$listed" | grep -Ec \'^([1-9]|1[0-2])$\')" -ge 12 ]; then die "cannot exclude every one of styles 1-12; style $n stays enabled (an older build needs one)"; fi', '        :')], CLI_FAST_ENV, []),
+    "settings-waits-for-an-agent-that-is-not-running": (CLI, [('  if [ -z "$(service_pid)" ]; then', '  if false; then')], CLI_FAST_ENV, []),
+    "install-does-not-create-the-lock-file": (CLI, [('  : > "$CONTROL_LOCK" || die "cannot create $CONTROL_LOCK"', '  :')], CLI_FAST_ENV, []),
+
+    # -- item 3: attended-check
+    "attended-input-window-opens-before-the-sampler": (ATTENDED, [
+        ('  LOG_S0="$(ck_file_size "$LOG")"; LOG_I0="$(ck_file_inode "$LOG")"; LOG1_SIG0="$(log1_signature)"\n  ledger_snapshot 0\n  EPOCH_S="$(date +%s)"\n  WIN_T0="$(sample_stamp)"', '  ledger_snapshot 0\n  EPOCH_S="$(date +%s)"\n  WIN_T0="$(sample_stamp)"'),
+        ('  return 0\n}\n\n# Opens the observation window.', '  LOG_S0="$(ck_file_size "$LOG")"; LOG_I0="$(ck_file_inode "$LOG")"; LOG1_SIG0="$(log1_signature)"\n  return 0\n}\n\n# Opens the observation window.')], {}, []),
+    "attended-input-window-has-no-end": (ATTENDED, [
+        ('    tail -c +"$((LOG_S0 + 1))" "$LOG" 2>/dev/null | head -c "$((LOG_S1 - LOG_S0))" | /usr/bin/awk', '    tail -c +"$((LOG_S0 + 1))" "$LOG" 2>/dev/null | /usr/bin/awk')], {}, []),
+    "attended-end-facts-read-after-the-sampler-stops": (ATTENDED, [
+        ('  collect_end\n  # The sampler must still be producing at the end.', '  # The sampler must still be producing at the end.'),
+        ('  stop_sampler\n  return 0\n}\n\n# One look at agent.log', '  stop_sampler\n  collect_end\n  return 0\n}\n\n# One look at agent.log')], {}, []),
+    "attended-rotated-file-not-read": (ATTENDED, [
+        ('    ROT_FILE="$LOG1"; ROT_NOTE="agent.log.1 is the file agent.log was at the start (same inode) and was read as well"', '    ROT_FILE=""; ROT_NOTE="not read"')], {}, []),
+    "attended-new-log-read-from-the-old-offset": (ATTENDED, [('    FV_WINDOW="$(fv_count "$LOG" 0)"', '    FV_WINDOW="$(fv_count "$LOG" "$LOG_S0")"')], {}, []),
+    "attended-rotated-file-read-from-its-first-byte": (ATTENDED, [('ROT_FV_HISTORY="$(fv_count "$ROT_FILE" "$HIST_OFFSET")"', 'ROT_FV_HISTORY="$(fv_count "$ROT_FILE" 0)"')], {}, []),
+    "attended-violation-count-stops-at-the-window-end": (ATTENDED, [
+        ('    FV_WINDOW="$(fv_count "$LOG" "$LOG_S0")"\n    if [ "$HIST_OK" = 1 ]',
+         '    FV_WINDOW="$(tail -c +"$((LOG_S0 + 1))" "$LOG" 2>/dev/null | head -c "$((LOG_S1 - LOG_S0))" | /usr/bin/awk \'$2 == "FOCUS_VIOLATION" { n++ } END { print n + 0 }\')"\n    if [ "$HIST_OK" = 1 ]')], {}, []),
+    "attended-freshness-ignored-at-the-start": (ATTENDED, [
+        ('  prove_fresh start; rc=$?; FRESH0="$FRESH_RESULT"\n  case "$rc" in\n    0) ;;\n    2) notrun sampler-freshness-unproven "the system\'s frontmost application could not be read at the start of the window ($FRESH0)" ;;\n    *) notrun sampler-stale "the sampler\'s frontmost pid differs from the system\'s at the start of the window ($FRESH0)" ;;\n  esac',
+         '  prove_fresh start; FRESH0="$FRESH_RESULT"')], {}, []),
+    "attended-freshness-ignored-at-the-end": (ATTENDED, [
+        ('  prove_fresh end; rc=$?; FRESH1="$FRESH_RESULT"\n  case "$rc" in\n    0) ;;\n    2) notrun sampler-freshness-unproven "the system\'s frontmost application could not be read at the end of the window ($FRESH1)" ;;\n    *) notrun sampler-stale "the sampler\'s frontmost pid differs from the system\'s at the end of the window ($FRESH1)" ;;\n  esac',
+         '  prove_fresh end; FRESH1="$FRESH_RESULT"')], {}, []),
+    "attended-unreadable-system-front-passes": (ATTENDED, [('    [ -n "$theirs" ] || return 2', '    [ -n "$theirs" ] || return 0')], {}, []),
+    "attended-hup-not-trapped": (ATTENDED, [('  trap on_signal INT TERM HUP\n', '  trap on_signal INT TERM\n')], {}, []),
+
+    # -- item 3: post-install-check (strictly read-only) and the gated direct-exec step
+    "post-runs-the-installed-launcher": (POST, [
+        ('check_launcher() {\n  local record="$REPO/launcher/clawd-pet-launch.sha256"', 'check_launcher() {\n  local record="$REPO/launcher/clawd-pet-launch.sha256"\n  "$LAUNCHER" </dev/null >/dev/null 2>&1 || true')], {}, []),
+    "post-launcher-hash-not-compared": (POST, [('  if [ "$LAUNCHER_SHA" = "$LAUNCHER_RECORDED" ]; then LAUNCHER_OK=1', '  if true; then LAUNCHER_OK=1')], {}, []),
+    "post-plist-program-not-checked": (POST, [('  if [ "$PLIST_PROGRAM" != "$LAUNCHER" ]; then', '  if false; then')], {}, []),
+    "post-launcher-symlink-accepted": (POST, [('  if [ ! -f "$LAUNCHER" ] || [ -L "$LAUNCHER" ]; then fail launcher-missing', '  if [ ! -f "$LAUNCHER" ]; then fail launcher-missing')], {}, []),
+    "dx-identity-control": (DIRECT_EXEC, [], {}, None),
+    "dx-reads-outside-the-life-count-as-observation": (DIRECT_EXEC, [('      if ($4 == 1 && $6 == 1) inlife++', '      if ($4 == 1) inlife++')], {}, []),
+    "dx-no-read-inside-the-life-passes": (DIRECT_EXEC, [('  if [ "$D_INLIFE" -lt 1 ]; then\n    notrun direct-exec-not-observed', '  if false; then\n    notrun direct-exec-not-observed')], {}, []),
+    "dx-one-failed-read-is-tolerated": (DIRECT_EXEC, [('  if [ "$D_FAILED" -gt 0 ]; then notrun window-lister-failed', '  if [ "$D_FAILED" -ge "$D_SNAPS" ]; then notrun window-lister-failed')], {}, []),
+    "dx-gap-between-reads-not-checked": (DIRECT_EXEC, [('  if [ "$D_GAP" -gt "$MAX_GAP_MS" ]; then\n    notrun direct-exec-observation-gap', '  if false; then\n    notrun direct-exec-observation-gap')], {}, []),
+    "dx-runs-the-installed-agent-itself": (DIRECT_EXEC, [('/usr/bin/perl "$OBSERVER" "$SAMPLER" "$LIMIT_MS" "$COPY" "$log" "$COPY_HOME" &', '/usr/bin/perl "$OBSERVER" "$SAMPLER" "$LIMIT_MS" "$AGENT" "$log" "$COPY_HOME" &')], {}, []),
+    "dx-copy-not-compared-with-the-installed-agent": (DIRECT_EXEC, [('  if [ -z "$COPY_SHA" ] || [ "$COPY_SHA" != "$INSTALLED_SHA0" ]; then fail direct-exec-copy-differs', '  if false; then fail direct-exec-copy-differs')], {}, []),
+    "dx-exit-code-ignored": (DIRECT_EXEC, [('  elif [ "$D_EXIT" != 0 ]; then', '  elif false; then')], {}, []),
+    "dx-window-ignored": (DIRECT_EXEC, [('  if [ "$D_WINDOWS" -gt 0 ]; then fail direct-exec-window', '  if false; then fail direct-exec-window')], {}, []),
+    "dx-limit-hit-ignored": (DIRECT_EXEC, [('  if [ "$D_LIMIT_HIT" = 1 ]; then\n    fail direct-exec-too-slow', '  if false; then\n    fail direct-exec-too-slow')], {}, []),
+    "dx-elapsed-time-ignored": (DIRECT_EXEC, [('  elif [ "$D_MS" -gt "$LIMIT_MS" ]; then\n    fail direct-exec-too-slow', '  elif false; then\n    fail direct-exec-too-slow')], {}, []),
+    "dx-agent-not-executable-ignored": (DIRECT_EXEC, [
+        ('  elif [ ! -f "$AGENT" ] || [ -L "$AGENT" ] || [ ! -x "$AGENT" ]; then', '  elif [ ! -f "$AGENT" ] || [ -L "$AGENT" ]; then')], {}, []),
+    "dx-gate-not-required": (DIRECT_EXEC, [('  if [ "$gate" != 1 ]; then\n    ck_warn "direct-exec-check: refused (64): this step runs a copy', '  if false; then\n    ck_warn "direct-exec-check: refused (64): this step runs a copy')], {}, []),
+    "dx-observer-never-stops-a-slow-copy": (DIRECT_EXEC_OBSERVE, [('    if ($end >= $limit_ms) {', '    if (0) {')], {}, []),
+
+    # -- item 3: the settings step
+    "ss-identity-control": (SETTINGS_STEP, [], {}, None),
+    "ss-applied-generation-not-checked": (SETTINGS_STEP, [('  elif ! ck_is_uint "$applied" || [ "$applied" -lt "$gen" ]; then', '  elif false; then')], {}, []),
+    "ss-second-change-not-made": (SETTINGS_STEP, [('    run_step "$word_second" 2\n', '')], {}, []),
+    "ss-agent-pid-not-compared": (SETTINGS_STEP, [('  if [ -z "$before_pid" ] || [ "$before_pid" != "$after_pid" ] || { [ -n "$P0" ] && [ "$after_pid" != "$P0" ]; }; then', '  if false; then')], {}, []),
+    "ss-log-order-not-checked": (SETTINGS_STEP, [('    $2 == "WALK" && $3 == word { walk = NR; if (settings && NR > settings) ordered = 1 }', '    $2 == "WALK" && $3 == word { walk = NR; ordered = 1 }')], {}, []),
+    "ss-gate-not-required": (SETTINGS_STEP, [('  if [ "$gate" != 1 ]; then\n    ck_warn "post-install-settings-step: refused (64): this step changes', '  if false; then\n    ck_warn "post-install-settings-step: refused (64): this step changes')], {}, []),
+    "ss-interrupt-leaves-the-setting-flipped": (SETTINGS_STEP, [('  if [ "$RESTORE_OWED" = 1 ]; then', '  if false; then')], {}, []),
+})
+
+
+# ---- Sprint 10: four false-PASS paths Codex found in the check scripts (spec 9b item 16, round-brief-clawd-pet-v2-s10.md) ----
+ROTATION_NOW = '  if { [ "$LOG_I0" != none ] && { [ "$LOG_I1" != "$LOG_I0" ] || [ "$ROT_NOW_I" != "$LOG_I0" ]; }; } || [ "$LOG_S1" -lt "$LOG_S0" ] || [ "$LOG1_SIG1" != "$LOG1_SIG0" ] || [ "$ROT_NOW_L1" != "$LOG1_SIG0" ]; then ROTATED=1; fi\n'
+ROTATION_AT_THE_FREEZE = '  if { [ "$LOG_I0" != none ] && [ "$LOG_I1" != "$LOG_I0" ]; } || [ "$LOG_S1" -lt "$LOG_S0" ] || [ "$LOG1_SIG1" != "$LOG1_SIG0" ]; then ROTATED=1; fi\n'
+END_READ_STATUS = '  read_status 1 || notrun status-unreadable "status.json could not be read at the end of the window"\n'
+# since the retained logs are scanned whole, a rotation that goes unseen no longer hides the violation itself (it stays a FAIL); what it hides is the
+# window's INPUT lines in the rotated file, so the scenarios turn red on their not-run codes (too-few-mousedowns, no-drag-sequence)
+A_AFTER_FREEZE = "a FOCUS_VIOLATION in the window, then agent.log rotated right after the end facts were frozen: not-run codes []"
+A_BETWEEN_READS = "a FOCUS_VIOLATION in the window, agent.log rotates between the read of the INPUT bytes and the read of the violations: not-run codes []"
+EXPECTED_FAILS.update({
+    # finding a: a rotation after the end facts were frozen, or between two reads of the analysis, must not hide a violation
+    "attended-rotation-after-the-freeze-not-seen": [A_AFTER_FREEZE, A_BETWEEN_READS,
+        "rotation after the freeze, no violation: the rotation is noted"],
+    "attended-analysis-not-repeated-when-the-log-rotates-during-it": ["rotation between the reads: the violation in the rotated file is counted",
+        "a log that keeps rotating: the evidence says that no analysis saw one generation"],
+    # finding b: the time inside a window-list read is unobserved
+    "dx-slow-read-between-two-reads-counted-as-observed-time": ["a read of the window list that takes 0.5 s, between two fast ones: verdict NOT RUN"],
+    "dx-time-inside-the-reads-not-counted": ["a read of the window list that takes 0.5 s, between two fast ones: verdict NOT RUN",
+                                             "the first read of the window list takes 0.45 s: verdict NOT RUN"],
+    # finding c: the sampler is proved live inside the window too
+    # without the looks the whole window is one look-gap, so the verdict stays NOT RUN; what the mutation removes is the stale and the
+    # unreadable reason, so the row names the reason checks of the two scenarios
+    "attended-sampler-freshness-not-looked-at-inside-the-window": [
+        "the system's frontmost app changes and returns inside the window, the sampler keeps its old pid, both end checks match: not-run codes [sampler-stale]",
+        "lsappinfo gives no answer for the looks inside the window: not-run codes [look-gap,sampler-freshness-unproven]"],
+    "attended-one-late-look-makes-the-sampler-stale": ["the system's answer differs from the sampler's at one look inside the window, and the pid is not the agent's: verdict PASS"],
+    # look-gap keeps this verdict NOT RUN (every look read nothing), so the row names what the mutation removes: the reason itself
+    "attended-unreadable-looks-inside-the-window-ignored": ["lsappinfo gives no answer for the looks inside the window: not-run codes [look-gap,sampler-freshness-unproven]"],
+    # finding d: the display counter is read after the last read of the end panel (and the end status read that moved with it still counts)
+    "attended-status-unreadable-at-the-end-ignored": ["status.json disappears during the window: not-run codes"],
+    "attended-display-counter-read-before-the-end-panel-re-read": ["displayChangeCount changes while the end panel is re-read: verdict NOT RUN"],
+})
+CONTROLS.update({
+    "attended-rotation-after-the-freeze-not-seen": (ATTENDED, [(ROTATION_NOW, ROTATION_AT_THE_FREEZE)], {}, []),
+    "attended-analysis-not-repeated-when-the-log-rotates-during-it": (ATTENDED, [
+        ('    [ "$before" != "$after" ] || return 0\n', '    return 0\n')], {}, []),
+    "dx-slow-read-between-two-reads-counted-as-observed-time": (DIRECT_EXEC, [
+        ('for (i = 2; i <= n; i++) { g = end[i] - start[i - 1]; if (g > maxgap) maxgap = g }', 'for (i = 2; i <= n; i++) { g = start[i] - end[i - 1]; if (g > maxgap) maxgap = g }')], {}, []),
+    "dx-time-inside-the-reads-not-counted": (DIRECT_EXEC, [
+        ('for (i = 2; i <= n; i++) { g = end[i] - start[i - 1]; if (g > maxgap) maxgap = g }', 'for (i = 2; i <= n; i++) { g = start[i] - end[i - 1]; if (g > maxgap) maxgap = g }'),
+        ('maxgap = (n > 0) ? end[1] : 0', 'maxgap = (n > 0) ? start[1] : 0')], {}, []),
+    "attended-sampler-freshness-not-looked-at-inside-the-window": (ATTENDED, [
+        ('  poll_log\n  poll_fresh\n}\n', '  poll_log\n}\n')], {}, []),
+    "attended-one-late-look-makes-the-sampler-stale": (ATTENDED, [('STALE_LOOKS=2 ', 'STALE_LOOKS=1 ')], {}, []),
+    "attended-unreadable-looks-inside-the-window-ignored": (ATTENDED, [
+        ('  if [ -n "$FRESHW_UNREAD_MAX" ] && [ "$FRESHW_UNREAD_MAX" -ge "$STALE_LOOKS" ]; then', '  if false; then')], {}, []),
+    "attended-status-unreadable-at-the-end-ignored": (ATTENDED, [(END_READ_STATUS, '  read_status 1 || true\n')], {}, []),
+    "attended-display-counter-read-before-the-end-panel-re-read": (ATTENDED, [
+        (END_READ_STATUS + '  LOG_S1=', '  LOG_S1='),
+        ('  P1="$AGENT_PID"\n', '  P1="$AGENT_PID"\n' + END_READ_STATUS)], {}, []),
+})
+
+
+# ---- Sprint 10 round 2: Codex's findings c1, c2 and e on round 1, and finding f (spec 9b item 17, round-brief-clawd-pet-v2-s10-r2.md) ----
+C1_ONE_LOOK = "one independent look inside the window names the agent while the sampler keeps its old pid: verdict FAIL"
+C1_END = "the end check's own look names the agent while the sampler keeps its old pid: verdict FAIL"
+C1_START = "the start check's own look names the agent while the sampler keeps its old pid: verdict FAIL"
+C2_RE_READ = "the real frontmost app is the agent only while the end panel is re-read, the sampler is cached: verdict FAIL"
+C2_LOOK_GAP = "the agent is frontmost only inside a 3 s read of the stage window at the end, the sampler is cached: verdict NOT RUN"
+C2_LOOK_GAP_START = "the agent is frontmost only inside a 3 s read of the stage window at the start, the sampler is cached: verdict NOT RUN"
+C2_LOOK_GAP_END = "the agent is frontmost only inside a 3 s look of the end proof, the sampler is cached: verdict NOT RUN"
+C2_OTHER_APP = "the real frontmost app is another app only while the end panel is re-read, the sampler is cached: verdict NOT RUN"
+C2_UNREADABLE = "lsappinfo gives no answer for the looks of the end read: verdict NOT RUN"
+E_DIGEST = "own home: the real (fake) HOME's digest is unchanged: nothing the copy wrote reached the install"
+EXPECTED_FAILS.update({
+    # finding c1: a look that names the agent is a FAIL, however many looks agree or disagree
+    "attended-agent-named-by-an-independent-look-tolerated": [C1_ONE_LOOK, C1_END, C1_START, C2_RE_READ],
+    "attended-window-looks-not-counted-as-sightings": [C1_ONE_LOOK, C2_RE_READ],
+    "attended-start-and-end-checks-not-counted-as-sightings": [C1_END, C1_START],
+    # finding c2: the looks go on through the end read of the stage window
+    "attended-no-looks-while-the-end-panel-is-re-read": [C2_RE_READ, C2_OTHER_APP, C2_UNREADABLE],
+    # finding c2 (round 2, main session): time between two looks is bounded, so a slow window-list read is not observed time
+    "attended-gap-between-looks-not-bounded": [C2_LOOK_GAP],
+    "attended-look-clock-starts-at-the-first-look": [C2_LOOK_GAP_START],
+    "attended-end-proof-and-closing-stretch-not-timed": [C2_LOOK_GAP_END],
+    "attended-closing-stretch-not-timed": ["nothing read after the start: the longest gap is the timed window, which only the closing measurement measures"],
+    # finding e: the copy runs with a scratch HOME of its own, and nothing runs unless that holds
+    "dx-copy-runs-with-the-real-home": [E_DIGEST, "own home: the copy was started with a HOME that is not the real one"],
+    "dx-scratch-home-may-be-the-real-home": ["make_home refuses a scratch directory that is the real HOME (rc 1, direct-exec-failed-to-start, says so)"],
+    "dx-scratch-home-may-lie-inside-the-install": ["make_home refuses a scratch directory inside the install (rc 1, says so)"],
+    "dx-install-may-lie-inside-the-scratch-home": ["make_home refuses a scratch directory that contains the install, which would be reachable through HOME (rc 1, says so)"],
+    "dx-observer-accepts-a-home-that-is-a-symbolic-link": ["observer: a HOME that is a symbolic link is refused (exit 2)"],
+    "dx-observer-accepts-a-home-that-is-not-empty": ["observer: a HOME that is not empty is refused (exit 2)"],
+    "dx-observer-accepts-a-relative-home": ["observer: a relative HOME is refused (exit 2)"],
+    # finding f: a NOT RUN that says why the instrument cannot observe
+    "dx-reason-does-not-say-a-read-outlasts-the-copy": ["instant exit: the reason says that a read takes longer than the copy lives, and names the shortest read"],
+    "dx-reason-does-not-say-the-gap-can-never-be-met": ["gap: a read longer than the allowed gap leaves the limit unmeetable, and the reason says so"],
+})
+# the decide() row for unreadable looks also covers the looks of the end read
+EXPECTED_FAILS["attended-unreadable-looks-inside-the-window-ignored"] = EXPECTED_FAILS["attended-unreadable-looks-inside-the-window-ignored"] + [C2_UNREADABLE]
+CONTROLS.update({
+    "attended-agent-named-by-an-independent-look-tolerated": (ATTENDED, [
+        ('  if [ -n "$L_AGENT" ] && [ "$L_AGENT" -gt 0 ]; then\n', '  if false; then\n')], {}, []),
+    "attended-window-looks-not-counted-as-sightings": (ATTENDED, [
+        ('  record_look "$theirs" "$1"\n', '  :\n')], {}, []),
+    "attended-start-and-end-checks-not-counted-as-sightings": (ATTENDED, [
+        ('    record_look "$theirs" "${1:-proof}"\n', '    :\n')], {}, []),
+    "attended-no-looks-while-the-end-panel-is-re-read": (ATTENDED, [
+        ('  fresh_look end-read\n  tries=0\n', '  tries=0\n'),
+        ('    fresh_look end-read\n    [ "$rc" -eq 0 ] || break\n', '    [ "$rc" -eq 0 ] || break\n'),
+        ('    sleep 0.1\n    fresh_look end-read\n    sleep 0.1\n', '    sleep 0.2\n')], {}, []),
+    "attended-look-clock-starts-at-the-first-look": (ATTENDED, [
+        ('  FRESHW_GAP_MAX_MS=0; FRESHW_LAST_MS="$(ck_now_ms)"', '  FRESHW_GAP_MAX_MS=0; FRESHW_LAST_MS=""'),
+        ('  if [ -n "$FRESHW_LAST_MS" ]; then\n    now="$(ck_now_ms)"; gap=$((now - FRESHW_LAST_MS))\n',
+         '  [ -n "$FRESHW_LAST_MS" ] || [ "$2" = start ] || FRESHW_LAST_MS="$(ck_now_ms)"\n  if [ -n "$FRESHW_LAST_MS" ]; then\n    now="$(ck_now_ms)"; gap=$((now - FRESHW_LAST_MS))\n')], {}, []),
+    "attended-end-proof-and-closing-stretch-not-timed": (ATTENDED, [
+        ('  if [ -n "$FRESHW_LAST_MS" ]; then\n    now="$(ck_now_ms)"; gap=$((now - FRESHW_LAST_MS))\n',
+         '  if [ -n "$FRESHW_LAST_MS" ] && [ "$2" != end ]; then\n    now="$(ck_now_ms)"; gap=$((now - FRESHW_LAST_MS))\n'),
+        ('  if [ -n "$FRESHW_LAST_MS" ]; then\n    gap=$(( $(ck_now_ms) - FRESHW_LAST_MS ))', '  if false; then\n    gap=$(( $(ck_now_ms) - FRESHW_LAST_MS ))')], {}, []),
+    # the closing measurement alone (a readable end look is stamped by record_look, so only an end proof that read nothing needs it)
+    "attended-closing-stretch-not-timed": (ATTENDED, [
+        ('  if [ -n "$FRESHW_LAST_MS" ]; then\n    gap=$(( $(ck_now_ms) - FRESHW_LAST_MS ))', '  if false; then\n    gap=$(( $(ck_now_ms) - FRESHW_LAST_MS ))')], {}, []),
+    "attended-gap-between-looks-not-bounded": (ATTENDED, [
+        ('  if [ -n "$FRESHW_GAP_MAX_MS" ] && [ "$FRESHW_GAP_MAX_MS" -gt "$LOOK_GAP_MAX_MS" ]; then\n', '  if false; then\n')], {}, []),
+    "dx-copy-runs-with-the-real-home": (DIRECT_EXEC_OBSERVE, [
+        ('    $ENV{HOME} = $home;\n    $ENV{CFFIXED_USER_HOME} = $home;\n', '')], {}, []),
+    "dx-scratch-home-may-be-the-real-home": (DIRECT_EXEC, [
+        ('  if [ -n "$real_home" ] && [ "$phys" = "$real_home" ]; then\n', '  if false; then\n')], {}, []),
+    "dx-scratch-home-may-lie-inside-the-install": (DIRECT_EXEC, [
+        ('    "$real_root"/*) notrun direct-exec-failed-to-start "the scratch HOME', '    "$real_root/never"/*) notrun direct-exec-failed-to-start "the scratch HOME')], {}, []),
+    "dx-install-may-lie-inside-the-scratch-home": (DIRECT_EXEC, [
+        ('    "$phys"/*) notrun direct-exec-failed-to-start "the install', '    "$phys/never"/*) notrun direct-exec-failed-to-start "the install')], {}, []),
+    "dx-observer-accepts-a-home-that-is-a-symbolic-link": (DIRECT_EXEC_OBSERVE, [
+        ('-d $home && !-l $home && opendir', '-d $home && opendir')], {}, []),
+    "dx-observer-accepts-a-home-that-is-not-empty": (DIRECT_EXEC_OBSERVE, [
+        ('if (@inside) {', 'if (0) {')], {}, []),
+    "dx-observer-accepts-a-relative-home": (DIRECT_EXEC_OBSERVE, [
+        ('m{^/[^\\0]+$}', 'm{^[^\\0]+$}')], {}, []),
+    "dx-reason-does-not-say-a-read-outlasts-the-copy": (DIRECT_EXEC, [
+        ('[ "$D_FAILED" -eq 0 ] && [ "$D_SNAPS" -ge 1 ] && printf', 'false && printf')], {}, []),
+    "dx-reason-does-not-say-the-gap-can-never-be-met": (DIRECT_EXEC, [
+        ('[ "$D_READ_MIN" -gt "$MAX_GAP_MS" ] && printf', 'false && printf')], {}, []),
+})
+
+
+# ---- the attended menu check (`--menu`, design-clawd-pet-v2-sM-attended.md v3.2, section 8.3): 47 rows. Each mutates ONE rule of scripts/attended-check.sh
+#      (the Perl program MENU_PERL inside it, or the shell around it) and is run against the one scenario that names it (CLAWD_TEST_ONLY), whose
+#      checks must turn red; "attended-identity-control" (above) runs the whole suite unmutated. ----
+def menu_row(name, scenario, red, edits):
+    CONTROLS[name] = (ATTENDED, edits, {"CLAWD_TEST_ONLY": "^scn_" + scenario + "$"}, [scenario + ": " + red])
+
+def menu_row_scenarios(name, pairs, edits):
+    """A row whose one mutation must turn red a check in each of several scenarios: pairs = [(scenario, red), ...]."""
+    CONTROLS[name] = (ATTENDED, edits, {"CLAWD_TEST_ONLY": "^scn_(" + "|".join(scenario for scenario, _ in pairs) + ")$"}, [scenario + ": " + red for scenario, red in pairs])
+
+menu_row("attended-menu-classified-against-union", "m_fail_click_taken_in_gap", "verdict FAIL", [
+    ("if ($gate && clear_out($iv->{body}, $c->{x}, $c->{y}) && clear_out($iv->{menu}, $c->{x}, $c->{y}) && defined $c->{x}) {",
+     "if ($gate && clear_out([ $iv->{body}[0], $iv->{menu}[1], $iv->{menu}[0] + $iv->{menu}[2] - $iv->{body}[0], $iv->{menu}[3] ], $c->{x}, $c->{y}) && defined $c->{x}) {")])
+menu_row("attended-menu-settle-deadline-removed", "m_fail_late_lines_after_early_end", "verdict FAIL", [
+    ('  [ "$((stamp - anchor))" -ge "$((W_MS + SETTLE_MS))" ] || return 1\n', '  :\n')])
+menu_row("attended-menu-stayed-open-ignored", "m_fail_menu_stayed_open", "verdict FAIL", [
+    ("left it open: \" . join('; ', @f2)) if @f2;", "left it open: \" . join('; ', @f2)) if 0;")])
+menu_row("attended-menu-write-failure-ignored", "m_fail_queued_pick_write_failed", "verdict FAIL", [
+    ("if (@bad_writes) { fail('menu-write-failed'", "if (0) { fail('menu-write-failed'")])
+menu_row("attended-menu-pick-wait-removed", "m_fail_queued_pick_write_failed", "verdict FAIL", [
+    ('  [ "$((stamp - LV_PEND))" -ge "$PICK_WAIT_MS" ] || return 1\n', '  :\n')])
+menu_row("attended-menu-declared-after-close-ignored", "m_fail_menu_declared_after_close", "fail codes", [
+    ("($dfinal eq 'open' || ($A{endwin} // 0) > 2)", "(($A{endwin} // 0) > 2)")])
+menu_row("attended-menu-window-count-after-close-ignored", "m_fail_menu_window_left_after_close_then_write", "verdict FAIL", [
+    ("($dfinal eq 'open' || ($A{endwin} // 0) > 2)", "($dfinal eq 'open')")])
+menu_row("attended-menu-state-from-last-menu-line", "m_nr_open_at_end_after_hover", "not-run codes", [
+    ("my $efinal = 'close'; for my $e (@E) { $efinal = $e->{t}; }",
+     "my $efinal = 'close'; for my $l (@L) { $efinal = (($l->{k} // '') eq 'open') ? 'open' : 'close' if $l->{t} eq 'MENU'; }")])
+menu_row("attended-menu-state-cross-check-removed", "m_nr_undeclared_open", "verdict NOT RUN", [
+    ('differ in count or kind" if $ek ne $dk;', 'differ in count or kind" if 0;'),
+    ("  push @n11, @why;\n", "")])
+menu_row("attended-menu-not-used-ignored", "m_nr_menu_not_used", "not-run codes", [
+    ("if (!$has_open) { notrun('menu-not-used'", "if (0) { notrun('menu-not-used'")])
+menu_row("attended-menu-open-button-not-checked", "m_nr_open_not_from_right_or_control", "verdict NOT RUN", [
+    ("my $consistent = ($how eq 'right' && $c->{button} eq 'right') || ($how eq 'control' && $c->{button} eq 'left' && $c->{ctrl} == 1);", "my $consistent = 1;")])
+menu_row("attended-menu-hover-distinct-items-not-required", "m_nr_one_hover_item", "verdict NOT RUN", [
+    ("if (scalar(keys %seenkv) >= 2) { $k2++; }", "if (scalar(keys %seenkv) >= 1) { $k2++; }")])
+menu_row("attended-menu-write-exit-3-counted", "m_nr_write_saved_not_confirmed", "verdict NOT RUN", [
+    ("elsif ($wexit ne '0') { $why = ", "elsif ($wexit ne '0' && $wexit ne '3') { $why = ")])
+menu_row("attended-menu-write-missing-ignored", "m_nr_pick_completion_missing", "not-run codes", [
+    ("notrun('menu-write-missing', join('; ', @n12)) if @n12;", "notrun('menu-write-missing', join('; ', @n12)) if 0;")])
+menu_row("attended-menu-landing-not-required", "m_nr_outside_click_without_landing", "verdict NOT RUN", [
+    ("elsif (!$ok) { $why = ", "elsif (0) { $why = ")])
+menu_row("attended-menu-landing-limit-widened", "m_nr_landing_520ms", "not-run codes", [
+    ("return ($d <= $LATE ? 1 : 0, $d, $tr);", "return ($d <= $LATE + 100 ? 1 : 0, $d, $tr);")])
+menu_row("attended-menu-landing-limit-off-by-one", "m_boundary_landing_at_500ms", "verdict PASS", [
+    ("return ($d <= $LATE ? 1 : 0, $d, $tr);", "return ($d < $LATE ? 1 : 0, $d, $tr);")])
+menu_row("attended-menu-typed-word-not-required", "m_nr_line_typed_before_open", "verdict NOT RUN", [
+    ("if (!@keyrows) { push @k5why,", "$k5++ if @PROMPTS; if (!@keyrows) { push @k5why,")])
+menu_row("attended-menu-typing-after-read-window-not-checked", "m_nr_word_typed_after_close", "verdict NOT RUN", [
+    ("if (!$seenwin) { $why = ", "if (0) { $why = ")])
+# R-TYPE: since clause (c) also excludes every later opening, scenario 24's reopen is rejected by (c) as well, so only scenario 46 (an EARLIER
+# opening, stamped late, which (c) never excludes) depends on clause (a) alone
+menu_row("attended-menu-typing-reopen-not-excluded", "m_nr_late_stamped_earlier_open_still_excluded", "not-run codes", [
+    ("if ($c->{ts} >= $lo && $c->{ts} <= $hi) { $why = ", "if (0) { $why = ")])
+menu_row_scenarios("attended-menu-typing-reopen-not-ordered-by-gen", [("m_nr_typed_word_across_queued_reopen", "not-run codes"), ("m_nr_typed_word_across_deferred_open", "not-run codes")], [
+    ('if ($c->{ts} <= $hi) { $why = "clause (c):', 'if (0) { $why = "clause (c):')])
+menu_row("attended-menu-typing-opening-click-not-required", "m_nr_typed_word_when_o_has_no_opening_click", "not-run codes", [
+    ('''if ($why eq '' && !$iv->{eopen}{line}{click}) { $why = "clause (b):''', '''if (0) { $why = "clause (b):''')])
+menu_row("attended-menu-prompt-without-window-check", "m_nr_menu_window_shown_late_and_briefly", "not-run codes", [
+    ('  [ -n "$match" ] || return 0\n', '  [ -n "$match" ] || match="${ow}x${oh}"\n')])
+menu_row("attended-menu-monitor-pairing-not-required", "m_nr_reopen_click_missed_by_monitor", "verdict NOT RUN", [
+    (") if @n7;", ") if 0;")])
+menu_row("attended-menu-unfrozen-interval-judged", "m_nr_menu_moved_while_open", "verdict NOT RUN", [
+    ("$iv->{judged} = ($iv->{sound} && $iv->{frozen}) ? 1 : 0;", "$iv->{judged} = ($iv->{sound}) ? 1 : 0;")])
+menu_row("attended-menu-open-at-start-interval-used", "m_nr_menu_open_at_window_start", "verdict NOT RUN", [
+    ("$iv->{frozen} = ($moved == 0 && !$eo->{seed}) ? 1 : 0;", "$iv->{frozen} = ($moved == 0) ? 1 : 0;"),
+    ('  if ($iv->{seedopen}) { push @n8,', '  if (0) { push @n8,')])
+menu_row_scenarios("attended-menu-calibration-not-required", [("m_nr_calibration_all_outside", "not-run codes"), ("m_nr_inside_pick_beside_a_calibration_miss", "not-run codes")], [
+    ('elsif (!$cal_proven) { $why = "calibration is not proven"; }', 'elsif (0) { $why = "calibration is not proven"; }'),
+    ('elsif (!$cal_proven) { $why = "calibration is not proven, so no item click counts"; }', 'elsif (0) { $why = "calibration is not proven, so no item click counts"; }')])
+menu_row("attended-menu-taken-click-not-gated-by-calibration", "m_nr_calibration_all_outside", "verdict NOT RUN", [
+    ("my $gate = ($cal_proven && !$xmis) ? 1 : 0;", "my $gate = (!$xmis) ? 1 : 0;")])
+menu_row("attended-menu-x1-cross-check-ignored", "m_nr_x1_body_window_differs_from_geom", "verdict NOT RUN", [
+    ("if ($res eq 'mismatch') { $xmis = 1;", "if (0) { $xmis = 1;")])
+menu_row("attended-menu-unexplained-frontmost-change-ignored", "m_nr_unexplained_frontmost_change", "verdict NOT RUN", [
+    (") if @unexplained;", ") if 0;")])
+menu_row("attended-menu-boundary-band-removed", "m_boundary_menu_click_on_edge_band", "verdict PASS", [
+    ("my $BAND = 1.0;", "my $BAND = 0.0;")])
+menu_row("attended-menu-writes-paired-by-key", "m_fail_queued_pick_write_failed", "verdict FAIL", [
+    ("  my $n = scalar(@{$WRITES{$id} || []});\n",
+     "  my $n = scalar(grep { ($_->{f}{key} // '') eq ($PICK{$id}{key} // '') && $_->{i} > $PICK{$id}{line}{i} } map { @$_ } values %WRITES);\n")])
+menu_row("attended-menu-drop-target-not-checked", "m_nr_pick_completion_missing", "not-run codes", [
+    ("    next unless defined $by && $by > $id && $PICK{$by} && $PICK{$id} && ($PICK{$by}{key} // '') eq ($PICK{$id}{key} // '');\n", "    next unless defined $by;\n"),
+    ("    $n++ if completions($by) >= 1;\n", "    $n++;\n")])
+menu_row("attended-menu-close-pairing-by-time-window", "m_late_close_line", "verdict PASS", [
+    ("  my ($c) = pair_click($et, $btn);\n  if ($c) { $l->{click} = $c;",
+     "  my ($c) = ($role eq 'close-outside') ? (grep { abs($l->{seen}{sig} - $_->{ts}) <= 1000 } @C)[0] : pair_click($et, $btn);\n  if ($c) { $l->{click} = $c;")])
+menu_row("attended-menu-outside-click-counted-without-close-pairing", "m_menu_closed_by_itself_before_outside_click", "verdict NOT RUN", [
+    ("# ---- kind 5: typing\n",
+     "# the mutant drops the pairing with a MENU close and nothing else: a click that no agent line names is credited against the latest judged opening\n"
+     "# that came before it (its et is later than that opening click's), when it is clearly outside body= and menu=, lands, and calibration is proven\n"
+     "for my $c (@C) {\n"
+     "  next if named($c) || taken($c) || !defined $c->{et};\n"
+     "  my $last;\n"
+     "  for my $v (@IVS) { next unless $v->{judged} && $v->{eopen}{line}{click} && $c->{et} > $v->{eopen}{line}{click}{et} + $TOL; $last = $v if !$last || $v->{eopen}{line}{click}{et} > $last->{eopen}{line}{click}{et}; }\n"
+     "  next unless $last;\n"
+     "  my ($lands) = landing($c);\n"
+     "  $k4++ if clear_out($last->{body}, $c->{x}, $c->{y}) && clear_out($last->{menu}, $c->{x}, $c->{y}) && $lands && $cal_proven;\n"
+     "}\n"
+     "# ---- kind 5: typing\n")])
+menu_row("attended-menu-stayed-open-span-shortened", "m_close_race_dictation", "verdict PASS", [
+    ("next unless $c->{ts} + 2 * $W <= $sclose;", "next unless $c->{ts} <= $sclose;")])
+menu_row("attended-menu-drag-rows-kept-in-menu-mode", "m_pass_baseline", "not-run codes", [
+    ('  [ "$MENU_MODE" = 1 ] || decide_drag_rows\n', '  decide_drag_rows\n')])
+menu_row("attended-menu-per-sample-change-rule-kept-in-menu-mode", "m_pass_baseline", "not-run codes", [
+    ('  [ "$MENU_MODE" != 1 ] || S_CHANGES=0 ', '  : ')])
+menu_row("attended-menu-clicks-mode-started-in-default-mode", "d_default_mode_ignores_menu_lines", "the sampler got no clicks argument", [
+    ('start_sampler() {\n  if [ "$MENU_MODE" = 1 ]; then', 'start_sampler() {\n  if true; then')])
+menu_row("attended-menu-delivery-placed-by-file-order", "m_fail_old_menu_delivery_in_next_interval", "verdict FAIL", [
+    ("  my $iv = $IV{$l->{f}{gen} // ''}; my $c = $l->{click};\n  next unless $iv && $iv->{judged} && $c;",
+     "  my ($iv) = grep { $_->{eopen}{i} < $l->{i} && (!$_->{eclose} || $l->{i} < $_->{eclose}{i}) } @IVS; my $c = $l->{click};\n  next unless $iv && $iv->{judged} && $c;")])
+menu_row("attended-menu-stale-line-read-as-close", "m_stale_outside_callback_ignored", "verdict PASS", [
+    ("next unless $l->{t} eq 'MENU' && ($l->{k} eq 'open' || $l->{k} eq 'close'); push @E, { t => $l->{k},",
+     "next unless $l->{t} eq 'MENU' && ($l->{k} eq 'open' || $l->{k} eq 'close' || $l->{k} eq 'stale'); push @E, { t => ($l->{k} eq 'stale' ? 'close' : $l->{k}),")])
+menu_row("attended-menu-outside-click-before-opening-credited", "m_nr_stale_outside_close_credits_newer_menu", "verdict NOT RUN", [
+    ("if (!defined $eto || !($c->{et} > $eto + $TOL)) {", "if (0) {")])
+menu_row("attended-menu-e-d-gen-not-compared", "m_nr_menu_open_and_geom_gens_differ", "verdict NOT RUN", [
+    ("if ($do->{gen} // 'none') ne ($eo->{gen} // 'none');", "if 0;")])
+menu_row("attended-menu-close-gen-not-compared", "m_nr_outside_close_names_another_gen", "verdict NOT RUN", [
+    ("if ($ec->{gen} // 'none') ne ($eo->{gen} // 'none');", "if 0;")])
+menu_row("attended-menu-unaccounted-click-ignored", "m_nr_dropped_click_of_an_old_panel", "verdict NOT RUN", [
+    (") if @unacc;", ") if 0;")])
+menu_row("attended-menu-cause-window-removed", "m_nr_dropped_click_shares_a_landing", "verdict NOT RUN", [
+    ("if (@in == 1 && $in[0] == $c) {", "if (1) {")])
+menu_row("attended-menu-outside-click-ordered-by-handling-time", "m_nr_outside_click_ordered_by_handling_time", "verdict NOT RUN", [
+    ("if (!defined $eto || !($c->{et} > $eto + $TOL)) {",
+     "if (!defined $iv->{eopen}{line}{click} || !($c->{ts} > $iv->{eopen}{line}{click}{ts})) {")])
+menu_row("attended-menu-stale-line-not-accounting", "m_close_race_dictation", "verdict PASS", [
+    ("if (scalar(@{$c->{lines}})) { $acc_by{$c->{n}} = 'line'; next; }", "if (named($c)) { $acc_by{$c->{n}} = 'line'; next; }")])
+menu_row("attended-menu-opening-click-et-not-used-for-the-order", "m_nr_outside_click_within_the_pairing_tolerance_of_the_opening_click", "verdict NOT RUN", [
+    ("$eto = $oc->{et} if $oc && defined $eto && $oc->{et} > $eto;", "")])
+menu_row("attended-menu-menu-line-et-not-used-for-the-order", "m_nr_outside_click_within_the_tolerance_of_the_menu_line", "verdict NOT RUN", [
+    ("my $eto = num($iv->{eopen}{line}{f}{et}); $eto = $oc->{et} if $oc && defined $eto && $oc->{et} > $eto;",
+     "my $eto = $oc ? $oc->{et} : num($iv->{eopen}{line}{f}{et});")])
+menu_row("attended-menu-cause-window-narrowed-to-bands", "m_nr_late_activation_lands_in_a_dropped_clicks_band", "verdict NOT RUN", [
+    ("my @in = grep { in_cause($tr->{T}, $_->{ts}) } @cand;",
+     "my @in = grep { $tr->{T} >= $_->{ts} - $EARLY && $tr->{T} <= $_->{ts} + $LATE } @cand;")])
+# An interrupt of a menu run (Opus final verdict residual, 2026-10-21): finish must stop and reap the reader and the sampler before it exits.
+# Each row runs the three signals of scn_m_interrupt; every one must name a job that was still running at the script's first read of the
+# samples (the record it writes there). That record does not prove an explicit wait: the later analysis-time look covers the reaping.
+_M_INTERRUPT_RED = ["m %s: at the first sample read neither job is running" % sig for sig in ("TERM", "INT", "HUP")]
+CONTROLS["attended-menu-interrupt-leaves-the-reader-running"] = (ATTENDED, [
+    ("  trap '' INT TERM HUP\n  stop_reader\n  stop_sampler\n", "  trap '' INT TERM HUP\n  stop_sampler\n")],
+    {"CLAWD_TEST_ONLY": "^scn_m_interrupt$"}, _M_INTERRUPT_RED)
+CONTROLS["attended-menu-interrupt-reads-the-samples-before-stopping-the-sampler"] = (ATTENDED, [
+    ("  trap '' INT TERM HUP\n  stop_reader\n  stop_sampler\n", "  trap '' INT TERM HUP\n  stop_reader\n"),
+    ("    analyze_samples\n    analyze_logs\n", "    analyze_samples\n    stop_sampler\n    analyze_logs\n")],
+    {"CLAWD_TEST_ONLY": "^scn_m_interrupt$"}, _M_INTERRUPT_RED)
+menu_row("attended-menu-signal-handler-keeps-the-interrupted-ifs", "m_signal_inside_an_ifs_read", "the handler splits words with the default IFS", [
+    ("  IFS=$' \\t\\n'\n  notrun interrupted", "  notrun interrupted")])
+menu_row("attended-menu-signal-handler-writes-into-the-interrupted-redirection", "m_signal_inside_a_redirected_function",
+         "the verdict reaches the script's own output", [
+    ("  if { : >&4; } 2>/dev/null; then finish >&4 2>&5; else finish; fi\n", "  finish\n")])
+# Amendment agent-log-retention: the scan of the retained logs reads only the first MiB of each, so a violation late in a 3 MiB file is missed.
+CONTROLS["attended-retained-scan-reads-only-the-first-mebibyte"] = (ATTENDED, [
+    ('if [ ! -L "$file" ] && [ -f "$file" ] && /bin/cat "$file" > "$copy" 2>/dev/null; then break; fi',
+     'if [ ! -L "$file" ] && [ -f "$file" ] && /usr/bin/head -c 1048576 "$file" > "$copy" 2>/dev/null; then break; fi')],
+    {"CLAWD_TEST_ONLY": "^scn_fail_retained_violation_at_the_end_of_a_near_limit_log1$"},
+    ["a FOCUS_VIOLATION line at the end of a 3 MiB retained agent.log.1: verdict FAIL"])
+# The history proof hashes only the first MiB of a file (the record covers the whole recorded length): an unchanged 3 MiB agent.log.1
+# no longer proves anything.
+CONTROLS["attended-history-proof-hashes-only-the-first-mebibyte"] = (ATTENDED, [
+    ("prefix_hash() { /usr/bin/head -c \"$2\" \"$1\" 2>/dev/null | /usr/bin/shasum -a 256 | cut -d' ' -f1; }",
+     "prefix_hash() { /usr/bin/head -c 1048576 \"$1\" 2>/dev/null | /usr/bin/shasum -a 256 | cut -d' ' -f1; }")],
+    {"CLAWD_TEST_ONLY": "^scn_pass_history_proof_with_a_near_limit_log1$"},
+    ["near-limit agent.log.1 unchanged since install: the install-time proof holds"])
+# The history proof compares agent.log.1's size only: a 3 MiB file changed at its end keeps a proof it no longer has.
+CONTROLS["attended-history-proof-compares-the-size-only"] = (ATTENDED, [
+    ('    if [ "$size" != "$bytes" ] || [ "$(prefix_hash "$LOG1" "$bytes")" != "$hash" ]; then\n',
+     '    if [ "$size" != "$bytes" ]; then\n')],
+    {"CLAWD_TEST_ONLY": "^scn_nr_history_near_limit_log1_changed_at_its_end$"},
+    ["near-limit agent.log.1 changed at its end: the install-time proof is not available"])
+CONTROLS["attended-menu-interrupt-does-not-wait-for-the-sampler"] = (ATTENDED, [
+    ('  ck_kill_job "$SAMPLER_PID"\n  wait "$SAMPLER_PID" 2>/dev/null\n', '  ck_kill_job "$SAMPLER_PID"\n')],
+    {"CLAWD_TEST_ONLY": "^scn_m_interrupt$"}, _M_INTERRUPT_RED)
+CONTROLS["attended-menu-interrupt-leaves-the-sampler-running"] = (ATTENDED, [
+    ("  trap '' INT TERM HUP\n  stop_reader\n  stop_sampler\n", "  trap '' INT TERM HUP\n  stop_reader\n")],
+    {"CLAWD_TEST_ONLY": "^scn_m_interrupt$"}, _M_INTERRUPT_RED)
+
+
+def make_tree(root, relative):
+    """A copy of the project made of symlinks, with `relative` replaced by a real file the caller may then mutate. Every directory on the
+    way to that file is a real directory of symlinks; everything else is linked."""
+    root.mkdir(parents=True)
+    parts = Path(relative).parts
+
+    def populate(source, destination, depth):
+        for entry in source.iterdir():
+            if depth == 0 and entry.name in (".git", ".evidence"):
+                continue
+            link = destination / entry.name
+            if depth == 0 and entry.name == ".build":
+                # A real directory of symlinks, not a symlink: paths made under it must be canonical, because the agent compares
+                # proc_pidpath() (always the resolved path) with the install path built from $HOME.
+                link.mkdir()
+                for child in entry.iterdir():
+                    # Scratch directories of the suites (cli-test, interrupt-test, attended-check-test, post-install-check-test, lsof-test, test-artifacts, ...) are not linked: the copy
+                    # makes its own, so every path the suites build stays canonical.
+                    if child.name.endswith("-test") or child.name == "test-artifacts" or child.name.startswith("dbg"):
+                        continue
+                    (link / child.name).symlink_to(child)
+            elif depth == 0 and entry.name == "chat-page" and entry.is_dir() and parts[0] != "chat-page":
+                # The installer refuses a symlinked chat-page directory or a symlinked file in it (bin/clawd-pet, "chat page incomplete"), so the
+                # copy gets real files; nothing mutates them.
+                shutil.copytree(entry, link)
+            elif depth < len(parts) - 1 and entry.name == parts[depth]:
+                link.mkdir()
+                populate(entry, link, depth + 1)
+            elif depth == len(parts) - 1 and entry.name == parts[depth]:
+                continue                       # the file under test: the caller writes its mutated copy
+            else:
+                link.symlink_to(entry)
+
+    populate(repo, root, 0)
+    (root / ".evidence").mkdir()
+    return root / relative
+
+
+# ---- Sprint 4c item 0: install copies every file the atlas names; uninstall removes them; post-install-check proves they are there ----
+CLI_ART_ENV = {"CLAWD_TEST_STOP_AFTER": "2b"}
+POST_ART_ENV = {"CLAWD_TEST_ONLY": "scn_post_art"}
+
+EXPECTED_FAILS.update({
+    "install-copies-only-the-frames-directory": ["every file the real atlas names is installed and identical to the repo's",
+                                                 "art fixture: every file the atlas names (nested motion frames, look layer, 250 in one directory) is installed byte for byte"],
+    "install-takes-an-asset-the-source-lacks": ["art fixture: ... and created nothing at all"],
+    "install-does-not-record-the-art-directories": ["art fixture: the manifest lists the directories, parents before children",
+                                                   "art fixture: the tree after uninstall is the tree before install (no file, no art directory left)"],
+    "uninstall-leaves-the-last-batch-of-files": ["art fixture: one uninstall removes the 250-file directory and every other art file"],
+    "install-accepts-a-path-that-leaves-art": ["art fixture: unsafe or unusable atlas paths are refused (exit 2) and nothing is created"],
+    "install-accepts-a-path-with-a-space": ["art fixture: unsafe or unusable atlas paths are refused (exit 2) and nothing is created"],
+    "post-install-check-skips-the-art-check": ["art whole: the evidence counts 5 named files and 0 missing",
+                                               "a nested motion frame the atlas names is not installed: verdict FAIL"],
+    "post-install-check-reads-only-the-frames-directory": ["a nested motion frame the atlas names is not installed: verdict FAIL",
+                                                           "only frames/ is installed (what the first v2 install copied): verdict FAIL"],
+    "post-install-check-counts-a-missing-file-as-present": ["a nested motion frame the atlas names is not installed: verdict FAIL"],
+    "post-install-check-accepts-a-symlink": ["a symlink in the art tree is not an installed file: verdict FAIL"],
+})
+
+CONTROLS.update({
+    "cli-art-identity-control": (CLI, [], CLI_ART_ENV, None),
+    "post-art-identity-control": (POST, [], POST_ART_ENV, None),
+    "install-copies-only-the-frames-directory": (CLI, [
+        ('ls frames/*.png; atlas_assets "$repo/art/clawd-atlas.json")', 'ls frames/*.png)')], CLI_ART_ENV, []),
+    "install-takes-an-asset-the-source-lacks": (CLI, [
+        ('    [ -f "$repo/art/$rel" ] && [ ! -L "$repo/art/$rel" ] || die "art contract incomplete: the atlas names art/$rel, which is missing from the source ($tail)"\n', '')], CLI_ART_ENV, []),
+    "install-does-not-record-the-art-directories": (CLI, [
+        ('  dirs+=("${subdirs[@]}")', '  dirs+=("$ROOT/bin" "$ROOT/art" "$ROOT/art/frames" "$ROOT/probe")')], CLI_ART_ENV, []),
+    "uninstall-leaves-the-last-batch-of-files": (CLI, [
+        ('  if [ "${#batch[@]}" -gt 0 ]; then remove_files "${batch[@]}"; batch=(); fi\n  # The Aqua diagnostics file', '  # The Aqua diagnostics file')], CLI_ART_ENV, []),
+    "install-accepts-a-path-that-leaves-art": (CLI, [
+        ("    ''|/*|*..*|./*|*/./*|*//*|*/) return 1 ;;", "    '') return 1 ;;")], CLI_ART_ENV, []),
+    "install-accepts-a-path-with-a-space": (CLI, [
+        ("  case \"$1\" in *[!A-Za-z0-9._/+-]*) return 1 ;; esac\n", "")], CLI_ART_ENV, []),
+    "post-install-check-skips-the-art-check": (POST, [("    check_launcher\n    check_art\n", "    check_launcher\n")], POST_ART_ENV, []),
+    "post-install-check-reads-only-the-frames-directory": (POST, [("""'"[^"]*\\.png"' "$atlas\"""", """'"frames/[^"]*\\.png"' "$atlas\"""")], POST_ART_ENV, []),
+    "post-install-check-counts-a-missing-file-as-present": (POST, [
+        ("""    if [ ! -f "$ROOT/art/$rel" ] || [ -L "$ROOT/art/$rel" ]; then\n      missing=""", """    if false; then\n      missing=""")], POST_ART_ENV, []),
+    "post-install-check-accepts-a-symlink": (POST, [
+        ("""    if [ ! -f "$ROOT/art/$rel" ] || [ -L "$ROOT/art/$rel" ]; then\n      missing=""", """    if [ ! -f "$ROOT/art/$rel" ]; then\n      missing=""")], POST_ART_ENV, []),
+})
+
+
+# ---- Sprint 4c: `clawd-pet update` (Tests/update.test.sh, and the update matrix of Tests/install-interrupt.test.sh) ----
+UPDATE = ("bin/clawd-pet", ["bash", "Tests/update.test.sh"], "update")
+UPDATE_INTERRUPT = ("bin/clawd-pet", ["bash", "Tests/install-interrupt.test.sh"], "interrupt")
+# the manifest line update writes for each file it puts in place through a .partial name (the pictures, new and replaced)
+PARTIAL_LINES = "  for rel in ${diff_rel[@]+\"${diff_rel[@]}\"} ${new_rel[@]+\"${new_rel[@]}\"}; do printf 'file %s/art/%s.partial\\n' \"$ROOT\" \"$rel\"; done\n"
+
+EXPECTED_FAILS.update({
+    "update-replaces-the-launcher": ["1: the plist, the launcher, control.json and control.lock are the same files (inode, mtime, bytes)",
+                                     "1: no operation of the update names the plist, the launcher, control.json or control.lock"],
+    "update-rewrites-the-plist": ["1: the plist, the launcher, control.json and control.lock are the same files (inode, mtime, bytes)",
+                                  "1: no operation of the update names the plist, the launcher, control.json or control.lock"],
+    "update-skips-the-installed-launcher-check": ["4: launcher-bytes-differ: refused with exit 2",
+                                                  "4: a repo with a rebuilt launcher (a different recorded sha256): refused with exit 2"],
+    "update-does-not-check-that-the-plist-names-the-launcher": ["4: plist-names-the-agent: refused with exit 2"],
+    "update-skips-the-repo-launcher-check": ["4: a repo launcher that does not match its own record: refused (exit 2) with the install's message"],
+    "update-confirms-on-the-generation-alone": ["3: old-status-only: exit 3", "3: status-without-a-pid: exit 3"],
+    "update-accepts-the-old-process": ["3: no-new-process: exit 3"],
+    "update-ignores-the-applied-generation": ["3: stale-generation: exit 3"],
+    "update-stops-the-job-and-loads-it-again": ["1: the only verbs sent to launchd besides list: exactly one kickstart -k of the label",
+                                                "1: no bootout, bootstrap or unload was ever sent"],
+    "update-does-not-record-the-new-files": ["1: every installed art file is in the manifest",
+                                             "1: one uninstall removes everything the install and the update made (exit 0)"],
+    "update-restarts-when-nothing-it-has-read-changed": ["2: cli-only: no restart (exit 0, no kickstart)",
+                                                         "2: ... the agent was not restarted (a picture it never read needs no restart)"],
+    "update-never-restarts": ["2: agent-only: a restart was sent (exactly one kickstart -k) and confirmed"],
+    "update-skips-the-pictures-that-differ": ["1: every file of the new art tree is installed byte for byte (232 new, 1 replaced, both catalogs)"],
+    "update-copies-replaced-pictures-in-place": ["1: a replaced picture is never copied straight to its final name (it goes through .partial)"],
+    "update-replaces-the-catalogs-before-the-pictures": ["1: the catalog is replaced after the last picture it names"],
+    "update-does-not-prove-the-art-after-the-copy": ["3: a picture copy spoiled after a successful cp: exit 2, says the installed art differs from the source"],
+    "update-does-not-prove-the-agent-before-it-goes-live": ["3: an agent copy spoiled after a successful cp: exit 2, says the copy does not match the sha256 of its source"],
+    # The manifest check (a path that is a symlink may not be listed) is a second layer behind both, so the first still refuses (by another
+    # message); the mutants are caught by the message and, for the marker, by the refusal itself.
+    "update-follows-a-symlink-where-a-picture-belongs": ["4: unlisted-art-path-is-a-symlink: says why (symlink where an art file belongs)"],
+    "update-ignores-an-install-marker-partial": ["4: marker-partial-present: refused with exit 2"],
+    "update-continues-after-a-failed-kickstart": ["3: kickstart-fails: exit 2"],
+    "update-does-not-wait-for-the-new-agent": ["3: delayed: exit 0, and it waited for the new agent (about 1 s)"],
+    # -- a setting whose key only a restart applies (Tests/update.test.sh section 5b)
+    "setting-ignores-which-generation-the-restart-report-is-for": ["5b: a report for generation 3 does not make a write of generation 5 restart the agent (exit 3 after 2 s, nothing sent but list)"],
+    "setting-never-restarts-the-agent": ["5b: overFullScreen: it says the agent was restarted and why", "5b: idleBudgetMode: exactly one restart was sent, with kickstart -k"],
+    "setting-restart-does-not-wait-for-the-new-process": ["5b: the restarted agent does not confirm: exit 3 with the reason"],
+    "status-hides-the-pending-restart": ["5b: ... and the keys that wait for a restart, with their generation"],
+    "update-leaves-the-new-directories-unrecorded": ["FAIL: update: the counting run is removed by one uninstall"],
+    "update-leaves-the-partial-names-unrecorded": ["one uninstall exited 2"],
+    # -- Sprint 4c round 3, fix 1: one update at a time (Tests/update.test.sh section 5e)
+    "update-takes-no-lock": ["5e: a second update is refused (exit 2) and names the reason",
+                             "5e: ... not one file changed, the first update's .partial files included (every path and checksum)"],
+    "update-lock-is-a-file-that-outlives-its-holder": ["5e: ... a third update takes the lock and finishes the cut one's job: marker found, restarted, confirmed (exit 0)",
+                                                       "5e: ... the lock is a kernel lock on the install directory: the install holds no lock file but control.lock"],
+    "update-lets-its-children-keep-the-lock": ["5e: the holder was killed: the lock is free again within seconds, though the stub's background job still runs"],
+    "update-uses-the-settings-lock-as-its-lock": ["5e: ... an update still runs to the end (exit 0): it never asks for control.lock",
+                                                  "5e: a second update is refused (exit 2) and names the reason"],
+    "update-waits-for-the-lock": ["5e: ... at once: it did not wait for the first (under 5 s)"],
+    # -- fix 2: a cut between the last copy and the restart is finished by a plain re-run (the marker)
+    "update-never-creates-the-restart-marker": ["8c: a plain update after the cut: exit 0 and it restarts the agent (pid 4242 -> 4243) instead of saying 'already up to date'"],
+    "update-ignores-the-restart-marker": ["5c: a marker with every file current: a plain update exits 0 and restarts the agent once (one kickstart -k, nothing else but list)"],
+    "update-creates-the-marker-after-the-first-copy": ["5c: ... the restart marker exists before the first copy"],
+    "update-removes-the-marker-before-the-restart-is-confirmed": ["5c: a restart that is not confirmed: exit 3, the marker stays, and the message says another update restarts it again"],
+    "update-keeps-the-marker-after-a-confirmed-restart": ["5c: ... the marker is gone, and no file but the marker and status.json changed"],
+    "update-creates-the-marker-before-the-manifest-lists-it": ["one uninstall exited 2"],
+    "update-does-not-list-the-marker-in-the-manifest": ["5c: an old manifest, an update that restarts: the line is added, the marker exists, exit 3 (unconfirmed)"],
+    "install-does-not-list-the-marker-in-the-manifest": ["2: nothing changed: exit 0 and 'already up to date'"],
+    # -- fix 3: a stale manifest.partial is discarded when provably a cut update's, refused otherwise
+    "update-never-discards-a-stale-manifest-partial": ["5d: a-complete-leftover: the update exits 0 and says in one line that it discarded a stale manifest.partial",
+                                                       "5d: an-empty-file: the update exits 0 and says in one line that it discarded a stale manifest.partial"],
+    "update-discards-any-manifest-partial": ["4: manifest-partial-present: refused with exit 2", "4: not-stale-reordered: refused with exit 2"],
+    "update-discards-a-partial-through-a-symlink": ["4: not-stale-symlink: refused with exit 2"],
+    "update-accepts-added-lines-anywhere": ["4: not-stale-in-the-wrong-place: refused with exit 2", "4: not-stale-after-the-end: refused with exit 2"],
+    "update-accepts-a-partial-with-a-path-outside-the-install": ["4: not-stale-outside-the-install: refused with exit 2"],
+    "update-accepts-a-partial-that-is-not-the-manifest-in-order": ["4: not-stale-reordered: refused with exit 2", "4: not-stale-repeats-a-line: refused with exit 2"],
+    "update-discards-the-partial-before-the-last-refusal": ["4: stale-partial-and-another-cause: not one file changed"],
+    # -- fix 5 (Tests/attended-check.test.sh): the end read of the stage window is repeated for 3 s
+    "attended-grace-shorter-than-the-drop-motion": ["the size returns at the last re-read of the 3 s grace (a drop motion that outlasts the 1 s of the old grace)"],
+    "attended-grace-longer-than-asked": ["the size returns one re-read after the grace: it never returned in time"],
+})
+
+CONTROLS.update({
+    "update-identity-control": (UPDATE, [], {}, None),
+    "update-interrupt-identity-control": (UPDATE_INTERRUPT, [], {}, None),
+
+    # -- what update must never touch
+    "update-replaces-the-launcher": (UPDATE, [
+        ('  if [ "$cli_changed" = 1 ]; then copy_executable "$repo/bin/clawd-pet" "$CLI_PATH" "$(sha256_of "$repo/bin/clawd-pet")"; fi\n',
+         '  if [ "$cli_changed" = 1 ]; then copy_executable "$repo/bin/clawd-pet" "$CLI_PATH" "$(sha256_of "$repo/bin/clawd-pet")"; fi\n'
+         '  copy_executable "$launcher_src" "$LAUNCHER" "$launcher_sha"\n')], {}, []),
+    "update-rewrites-the-plist": (UPDATE, [
+        ('  if [ "$cli_changed" = 1 ]; then copy_executable "$repo/bin/clawd-pet" "$CLI_PATH" "$(sha256_of "$repo/bin/clawd-pet")"; fi\n',
+         '  if [ "$cli_changed" = 1 ]; then copy_executable "$repo/bin/clawd-pet" "$CLI_PATH" "$(sha256_of "$repo/bin/clawd-pet")"; fi\n'
+         '  cp "$PLIST" "$PLIST.new" && mv "$PLIST.new" "$PLIST"\n')], {}, []),
+    "update-skips-the-installed-launcher-check": (UPDATE, [
+        ('  [ "$installed_sha" = "$launcher_sha" ] || die "the installed launcher (sha256 $installed_sha) is not the one recorded in launcher/clawd-pet-launch.sha256 ($launcher_sha); a different launcher is a different background item, so update never replaces it; uninstall and install again to adopt it (nothing was changed)"\n', '')], {}, []),
+    "update-does-not-check-that-the-plist-names-the-launcher": (UPDATE, [
+        ('  if [ "$(/usr/bin/plutil -extract ProgramArguments raw -o - "$PLIST" 2>/dev/null)" != 1 ] || [ "$(/usr/bin/plutil -extract ProgramArguments.0 raw -o - "$PLIST" 2>/dev/null)" != "$LAUNCHER" ]; then\n',
+         '  if false; then\n')], {}, []),
+    "update-skips-the-repo-launcher-check": (UPDATE, [
+        ('  collect_art_files "$repo" "nothing was changed"\n  collect_page_files "$repo" "nothing was changed"\n  verify_repo_launcher "$repo" "nothing was changed"\n',
+         '  collect_art_files "$repo" "nothing was changed"\n  collect_page_files "$repo" "nothing was changed"\n  launcher_src="$repo/launcher/clawd-pet-launch"\n'
+         '  launcher_sha="$(recorded_launcher_sha "$repo/launcher/clawd-pet-launch.sha256")" || die "launcher record unreadable"\n')], {}, []),
+
+    # -- the restart and the wait for the new process
+    "update-confirms-on-the-generation-alone": (UPDATE, [
+        ('      if [ "$recorded" != "$pid" ]; then RESTART_WHY=', '      if false; then RESTART_WHY=')], {}, []),
+    "update-accepts-the-old-process": (UPDATE, [
+        ('    if [ -n "$pid" ] && [ "$pid" != "$old" ]; then\n      NEW_PID="$pid"', '    if [ -n "$pid" ]; then\n      NEW_PID="$pid"')], {}, []),
+    "update-ignores-the-applied-generation": (UPDATE, [
+        ('      elif applied_at_least "$gen"; then return 0', '      elif true; then return 0')], {}, []),
+    "update-stops-the-job-and-loads-it-again": (UPDATE, [
+        ('  "$LAUNCHCTL" kickstart -k "$DOMAIN/$LABEL" 8<&- || die "the files are updated, but launchctl kickstart -k failed; the restart is still pending; run \'clawd-pet stop\' and \'clawd-pet start\' to run the new build"\n',
+         '  "$LAUNCHCTL" bootout "$DOMAIN/$LABEL"; "$LAUNCHCTL" bootstrap "$DOMAIN" "$PLIST" || die "the files are updated, but launchctl kickstart -k failed; the restart is still pending; run \'clawd-pet stop\' and \'clawd-pet start\' to run the new build"\n')], {}, []),
+    "update-restarts-when-nothing-it-has-read-changed": (UPDATE, [('  restart_needed=$agent_changed\n', '  restart_needed=1\n')], {}, []),
+    "update-never-restarts": (UPDATE, [('  if [ "$restart_needed" = 0 ] && [ "$force_restart" = 0 ]; then\n', '  if true; then\n')], {}, []),
+    "update-continues-after-a-failed-kickstart": (UPDATE, [
+        (' || die "the files are updated, but launchctl kickstart -k failed; the restart is still pending; run \'clawd-pet stop\' and \'clawd-pet start\' to run the new build"\n', ' || true\n')], {}, []),
+    "update-does-not-wait-for-the-new-agent": (UPDATE, [
+        ('    [ "$(( $(now_ms) - start ))" -lt "$((RESTART_WAIT_S * 1000))" ] || return 3\n', '    return 3\n')], {}, []),
+
+    # -- what is copied, in which order, and how it is proved
+    "update-does-not-record-the-new-files": (UPDATE, [('  UPDATE_STARTED=1\n  if [ "$added_n" -gt 0 ]; then\n', '  UPDATE_STARTED=1\n  if false; then\n')], {}, []),
+    "update-skips-the-pictures-that-differ": (UPDATE, [('diff) diff_rel+=("$rel") ;;', 'diff) : ;;')], {}, []),
+    "update-copies-replaced-pictures-in-place": (UPDATE, [
+        ('      cp "$from/$rel" "$name.partial" || die "copy failed: $name"\n',
+         '      cp "$from/$rel" "$name" || die "copy failed: $name"\n      continue\n')], {}, []),
+    "update-replaces-the-catalogs-before-the-pictures": (UPDATE, [
+        ('  # New directories, parents first, in one mkdir.\n',
+         '  place_art_files "$repo" clawd-atlas.json claude-code-elements.json\n  # New directories, parents first, in one mkdir.\n')], {}, []),
+    "update-does-not-prove-the-art-after-the-copy": (UPDATE, [
+        ('  [ -z "$bad" ] || die "the installed art differs from the source after the copy: $(printf \'%s\' "$bad" | head -n 3 | tr \'\\n\' \' \')"\n', '')], {}, []),
+    "update-does-not-prove-the-agent-before-it-goes-live": (UPDATE, [
+        ('copy_executable "$binary" "$AGENT" "$(sha256_of "$binary")"', 'copy_executable "$binary" "$AGENT"')], {}, []),
+    "update-follows-a-symlink-where-a-picture-belongs": (UPDATE, [
+        ('    [ ! -L "$f" ] || die "refusing a symlink where an art file belongs: $f (nothing was changed)"\n', '')], {}, []),
+    "update-ignores-an-install-marker-partial": (UPDATE, [
+        ('  if [ -e "$MARKER_PARTIAL" ] || [ -L "$MARKER_PARTIAL" ]; then\n    die "refusing: $MARKER_PARTIAL exists,', '  if false; then\n    die "refusing: $MARKER_PARTIAL exists,')], {}, []),
+
+    # -- a setting whose key only a restart applies
+    "setting-ignores-which-generation-the-restart-report-is-for": (UPDATE, [('  [ "$at" -ge "$1" ] || return 0\n', '')], {}, []),
+    "setting-never-restarts-the-agent": (UPDATE, [
+        ('    if [ -n "$pending" ]; then restart_for_setting "$gen" "$what" "$pending"; return $?; fi\n', '')], {}, []),
+    "setting-restart-does-not-wait-for-the-new-process": (UPDATE, [
+        ('  if wait_restarted "$old" "$gen"; then\n    if [ "$AQUA_REACT_OFF" = 1 ]; then\n', '  if true; then\n    if [ "$AQUA_REACT_OFF" = 1 ]; then\n')], {}, []),
+    "status-hides-the-pending-restart": (UPDATE, [
+        ('    if [ -n "$restart" ]; then echo "restart required:', '    if false; then echo "restart required:')], {}, []),
+
+    # -- cut at every operation (Tests/install-interrupt.test.sh)
+    "update-leaves-the-new-directories-unrecorded": (UPDATE_INTERRUPT, [
+        ("  for d in ${art_dirs[@]+\"${art_dirs[@]}\"}; do printf 'dir %s\\n' \"$d\"; done\n  printf 'file %s\\n' \"$RESTART_MARKER\"\n", "  printf 'file %s\\n' \"$RESTART_MARKER\"\n")], {}, []),
+    "update-leaves-the-partial-names-unrecorded": (UPDATE_INTERRUPT, [(PARTIAL_LINES, PARTIAL_LINES.replace('${diff_rel[@]+"${diff_rel[@]}"} ', ''))], {}, []),
+    "update-leaves-the-new-pictures-partial-names-unrecorded": (UPDATE_INTERRUPT, [(PARTIAL_LINES, PARTIAL_LINES.replace(' ${new_rel[@]+"${new_rel[@]}"}', ''))], {}, []),
+    "update-leaves-the-new-pictures-partial-names-out-of-the-manifest": (UPDATE, [(PARTIAL_LINES, PARTIAL_LINES.replace(' ${new_rel[@]+"${new_rel[@]}"}', ''))], {}, []),
+
+    # -- Sprint 4c round 3, fix 1: one update at a time
+    "update-takes-no-lock": (UPDATE, [('  take_update_lock\n  if [ -e "$MARKER_PARTIAL" ]', '  if [ -e "$MARKER_PARTIAL" ]')], {}, []),
+    "update-lock-is-a-file-that-outlives-its-holder": (UPDATE, [
+        ('  if ! exec 8<"$ROOT"; then die "cannot read $ROOT to lock it; $untouched"; fi\n  lock_descriptor 8 "$wait_s"\n  case $? in\n    0) ;;\n    75) die',
+         '  ( set -C; echo $$ > "$ROOT/update.lock" ) 2>/dev/null\n  case $? in\n    0) ;;\n    1) die')], {}, []),
+    "update-lets-its-children-keep-the-lock": (UPDATE, [('kickstart -k "$DOMAIN/$LABEL" 8<&- || die', 'kickstart -k "$DOMAIN/$LABEL" || die')], {}, []),
+    "update-uses-the-settings-lock-as-its-lock": (UPDATE, [
+        ('  if ! exec 8<"$ROOT"; then die "cannot read $ROOT to lock it; $untouched"; fi\n  lock_descriptor 8 "$wait_s"\n  case $? in',
+         '  lock_control\n  case 0 in')], {}, []),
+    "update-waits-for-the-lock": (UPDATE, [('  lock_descriptor 8 "$wait_s"\n', '  lock_descriptor 8 8\n')], {}, []),
+
+    # -- fix 2: the restart marker
+    "update-never-creates-the-restart-marker": (UPDATE_INTERRUPT, [
+        ('  if [ "$restart_needed" = 1 ] && [ "$marker_found" = 0 ]; then\n    : > "$RESTART_MARKER"', '  if false; then\n    : > "$RESTART_MARKER"')], {}, []),
+    "update-ignores-the-restart-marker": (UPDATE, [
+        ('  if [ -e "$RESTART_MARKER" ] || [ -L "$RESTART_MARKER" ]; then\n    [ -f "$RESTART_MARKER" ]', '  if false; then\n    [ -f "$RESTART_MARKER" ]')], {}, []),
+    "update-creates-the-marker-after-the-first-copy": (UPDATE, [
+        ('  if [ "$restart_needed" = 1 ] && [ "$marker_found" = 0 ]; then\n    : > "$RESTART_MARKER" || die "cannot create $RESTART_MARKER"\n  fi\n', ''),
+        ('  # Each executable is proved by its sha256', '  if [ "$restart_needed" = 1 ] && [ "$marker_found" = 0 ]; then : > "$RESTART_MARKER"; fi\n  # Each executable is proved by its sha256')], {}, []),
+    "update-removes-the-marker-before-the-restart-is-confirmed": (UPDATE, [
+        ('  if wait_restarted "$old_pid" "$gen"; then\n    clear_restart_marker\n', '  if wait_restarted "$old_pid" "$gen"; then\n'),
+        ('  old_pid="$(service_pid)"\n', '  old_pid="$(service_pid)"\n  clear_restart_marker\n')], {}, []),
+    "update-keeps-the-marker-after-a-confirmed-restart": (UPDATE, [
+        ('  if wait_restarted "$old_pid" "$gen"; then\n    clear_restart_marker\n', '  if wait_restarted "$old_pid" "$gen"; then\n')], {}, []),
+    "update-creates-the-marker-before-the-manifest-lists-it": (UPDATE_INTERRUPT, [
+        ('  if [ "$restart_needed" = 1 ] && [ "$marker_found" = 0 ]; then\n    : > "$RESTART_MARKER" || die "cannot create $RESTART_MARKER"\n  fi\n', ''),
+        ('  UPDATE_STARTED=1\n  if [ "$added_n" -gt 0 ]; then\n', '  UPDATE_STARTED=1\n  if [ "$restart_needed" = 1 ] && [ "$marker_found" = 0 ]; then : > "$RESTART_MARKER"; fi\n  if [ "$added_n" -gt 0 ]; then\n')], {}, []),
+    "update-does-not-list-the-marker-in-the-manifest": (UPDATE, [
+        ('  printf \'file %s\\n\' "$RESTART_MARKER"\n', '')], {}, []),
+    "install-does-not-list-the-marker-in-the-manifest": (UPDATE, [
+        ('"$ROOT/lock" "$RESTART_MARKER" "$LEDGER")', '"$ROOT/lock" "$LEDGER")')], {}, []),
+
+    # -- fix 3: a stale manifest.partial
+    "update-never-discards-a-stale-manifest-partial": (UPDATE, [
+        ('manifest_partial_is_stale() {\n  [ -f "$1" ] && [ ! -L "$1" ] || return 1\n', 'manifest_partial_is_stale() {\n  return 1\n  [ -f "$1" ] && [ ! -L "$1" ] || return 1\n')], {}, []),
+    "update-discards-any-manifest-partial": (UPDATE, [
+        ('manifest_partial_is_stale() {\n  [ -f "$1" ] && [ ! -L "$1" ] || return 1\n', 'manifest_partial_is_stale() {\n  return 0\n  [ -f "$1" ] && [ ! -L "$1" ] || return 1\n')], {}, []),
+    "update-discards-a-partial-through-a-symlink": (UPDATE, [
+        ('manifest_partial_is_stale() {\n  [ -f "$1" ] && [ ! -L "$1" ] || return 1\n', 'manifest_partial_is_stale() {\n  [ -f "$1" ] || return 1\n')], {}, []),
+    "update-accepts-added-lines-anywhere": (UPDATE, [
+        ('      if (p == 0 || k != p - 1 || $0 !~ /^(file|dir) /) { bad = 1; exit }', '      if ($0 !~ /^(file|dir) /) { bad = 1; exit }')], {}, []),
+    "update-accepts-a-partial-with-a-path-outside-the-install": (UPDATE, [
+        ('      if (index(path, root "/") != 1 || index(path, "/../") || index(path, "/./") || path ~ /\\/\\.\\.$/) { bad = 1; exit }\n', '')], {}, []),
+    "update-accepts-a-partial-that-is-not-the-manifest-in-order": (UPDATE, [
+        ('      if ($0 in known) { if (k < n && $0 == live[k + 1]) { k++; next } bad = 1; exit }', '      if ($0 in known) { next }')], {}, []),
+    "update-discards-the-partial-before-the-last-refusal": (UPDATE, [
+        ('    stale_partial=1\n  fi\n', '    stale_partial=1\n    rm -f -- "$MANIFEST_PARTIAL"\n  fi\n')], {}, []),
+
+    # -- fix 5: the stage window's end read is repeated for 3 s
+    "attended-grace-shorter-than-the-drop-motion": (ATTENDED, [('GRACE_RE_READS=15 ', 'GRACE_RE_READS=5 ')], {}, []),
+    "attended-grace-longer-than-asked": (ATTENDED, [('GRACE_RE_READS=15 ', 'GRACE_RE_READS=20 ')], {}, []),
+})
+
+
+# ---- Sprint 9 round 1: hardening (spec 9b items 9, 11, 12, 13) ----
+EXPECTED_FAILS.update({
+    # -- item 3: the wording follows the facts
+    "update-says-restarted-onto-the-files-before-the-restart": [
+        "5c: a re-run whose restart is not confirmed: exit 3, 'restart pending', and it never says the agent is restarted onto the installed files",
+        "5c: a re-run whose restart cannot be sent: exit 2, 'restart pending', and it never says the agent is restarted onto the installed files"],
+    "update-never-says-the-agent-is-restarted-onto-the-files": [
+        "5c: the confirmed re-run says 'restart pending' before it sends the restart and 'restarted onto the installed files' only after the confirmed restart"],
+    "update-unconfirmed-restart-does-not-say-pending": ["5c: ... and it says the restart is pending (it never says the agent is restarted onto the installed files)"],
+    "update-failed-kickstart-does-not-say-pending": [
+        "5c: a re-run whose restart cannot be sent: exit 2, 'restart pending', and it never says the agent is restarted onto the installed files"],
+    # -- item 2: uninstall after a cut update
+    "uninstall-refuses-a-stale-manifest-partial": ["5f: a-complete-leftover: uninstall exits 0 and says in one line that it discarded a stale manifest.partial"],
+    "uninstall-discards-any-manifest-partial": ["5f: not stale (a-foreign-file-with-its-name): uninstall refuses (exit 2) and names the file"],
+    "uninstall-takes-no-lock": ["5f: an uninstall while an update holds the lock: exit 2, 'another update is already running', nothing removed"],
+    "uninstall-discards-the-partial-before-the-last-refusal": [
+        "5f: an uninstall refused after it judged the partial (the process listing fails): exit 2 and the partial is still there"],
+    "uninstall-refuses-the-partial-of-a-cut-update-in-the-matrix": ["one uninstall exited 2"],
+})
+
+CONTROLS.update({
+    # -- item 3
+    "update-says-restarted-onto-the-files-before-the-restart": (UPDATE, [
+        ('  if [ "$marker_found" = 1 ]; then echo "clawd-pet: an earlier update was cut before its restart was confirmed; restart pending."; fi\n',
+         '  if [ "$marker_found" = 1 ]; then echo "clawd-pet: an earlier update was cut before its restart was confirmed; the agent is restarted onto the installed files."; fi\n')], {}, []),
+    "update-never-says-the-agent-is-restarted-onto-the-files": (UPDATE, [
+        ('    if [ "$marker_found" = 1 ]; then echo "clawd-pet: the agent is restarted onto the installed files."; fi\n', '')], {}, []),
+    "update-unconfirmed-restart-does-not-say-pending": (UPDATE, [
+        ('$RESTART_WHY; restart pending. Check', '$RESTART_WHY. Check')], {}, []),
+    "update-failed-kickstart-does-not-say-pending": (UPDATE, [
+        ("failed; the restart is still pending; run 'clawd-pet stop'", "failed; run 'clawd-pet stop'")], {}, []),
+    # -- item 2
+    "uninstall-refuses-a-stale-manifest-partial": (UPDATE, [
+        ('      manifest_partial_is_stale "$MANIFEST_PARTIAL" "$MANIFEST" || die "$MANIFEST_PARTIAL sits beside', '      false || die "$MANIFEST_PARTIAL sits beside')], {}, []),
+    "uninstall-discards-any-manifest-partial": (UPDATE, [
+        ('      manifest_partial_is_stale "$MANIFEST_PARTIAL" "$MANIFEST" || die "$MANIFEST_PARTIAL sits beside', '      true || die "$MANIFEST_PARTIAL sits beside')], {}, []),
+    "uninstall-takes-no-lock": (UPDATE, [('    take_update_lock uninstall\n', '')], {}, []),
+    "uninstall-discards-the-partial-before-the-last-refusal": (UPDATE, [
+        ('      stale_partial=1\n    fi\n  elif [ "$marker" = present ]', '      stale_partial=1\n      rm -f -- "$MANIFEST_PARTIAL"\n    fi\n  elif [ "$marker" = present ]')], {}, []),
+    "uninstall-refuses-the-partial-of-a-cut-update-in-the-matrix": (UPDATE_INTERRUPT, [
+        ('      manifest_partial_is_stale "$MANIFEST_PARTIAL" "$MANIFEST" || die "$MANIFEST_PARTIAL sits beside', '      false || die "$MANIFEST_PARTIAL sits beside')], {}, []),
+})
+
+# -- item 1: every file the CLI publishes by rename is flushed (F_FULLFSYNC) before the rename and its directory after it (Tests/update.test.sh 1b)
+SET_AUDIT = "1c: ... 33 renames (the manifest and the 32 pictures), every one flushed before it, every directory flushed after, nothing out of order"
+SET_AUDIT_CHUNKED = "1c: ... 33 renames, in order"
+SET_COUNT = "1c: ... 45 paths flushed (the manifest and its directory, the 32 copies, the 3 distinct directories, the 8 directories of the art tree) in 5 perl starts"
+SET_CALLS = "1c: ... the copies go in one call of 32 paths, the directories in one call of 3, the art tree in one call of 8"
+SET_FILE_FAILS = "1c: the flush of the second set's copies fails: exit 2, it names the set and says none of it was moved, and the update stopped partway"
+SET_DIR_FAILS = "1c: the flush of a set's directories fails: exit 2 and it says so (all 32 renames are done, the update can be repeated)"
+CATALOG_WAITS = "1c: the picture directory cannot be flushed: exit 2, the picture was renamed, no catalog and no executable was"
+CATALOG_AUDIT = "1b: the catalogs are renamed after the directory of the pictures they name is flushed"
+MANIFEST_FIRST = "1b: the manifest and its directory are on the disk before the first directory is made or file copied (the write-ahead record of what the update writes)"
+INSTALL_MANIFEST_FIRST = "1b: the install's manifest and its directory are on the disk before any directory below it is made or file copied"
+NEW_STRAIGHT = "1: a new picture is never copied straight to its final name, nor into its directory (it goes through .partial, flushed, then renamed)"
+ONLY_PARTIAL = "1: no copy into the art tree names anything but a .partial file"
+NEW_ONE_BY_ONE = "1: the 30 new pictures of one directory are copied one by one, each to its .partial name, and renamed one by one (30 cp calls, 30 mv calls)"
+NEW_LISTED = "1: ... and so is every new picture (30 in motions/M2, one in looks/L2, one in frames)"
+INTERRUPT_ONLY_PARTIAL = "update: no copy into the art tree names anything but a .partial file (a new picture is never copied to its final name)"
+INTERRUPT_SETS = "update: the twelve pictures are three sets of four: four copies, four renames, four copies, four renames, four copies, four renames"
+ART_TREE_FLUSH = "1b: the whole art tree (8 directories, in one call) is flushed, looks/L1 and motions/ among them, which no picture of this update sits in"
+ART_TREE_ORDER = "1b: ... and that call comes after the last picture is renamed and before the first catalog is"
+RERUN_FLUSHES_FIRST = "1c: ... and it flushes the picture directory whose flush had failed BEFORE it renames the first catalog (a catalog never goes in on a picture whose rename may be lost)"
+RERUN_ALL_DIRS = "1c: ... by then every directory of the art tree is flushed (art/frames, art/motions, motions/M1, motions/M2, looks/L2)"
+RERUN_DIR_FLUSHED = "1c: ... the re-run finds every picture renamed and matching, renames none, and still flushes the directory whose flush had failed (looks/L2): a rename that was not flushed is not left to a power cut"
+ART_TREE_FAILS = "1c: the flush of the art tree's directories fails: exit 2, it says so, every picture is renamed, no catalog and no executable is"
+CHUNK_ABOVE = "1c: ... above the cap is the cap, so the argument list can never grow past 400 files (401, 1000, 5000 and a number too long for the shell's integers are 400)"
+UPTODATE_FLUSHES = "2: ... and it still flushes the directory whose flush had failed (motions/M1) before it says so"
+PUBLISH_AUDITS = ["1b: the install publishes five files by rename (the marker, the manifest, the agent, the CLI, the launcher), each flushed before and its directory after",
+                  "1b: it makes 38 renames (the manifest, the 32 new pictures and the one it replaces, the two catalogs, the agent, the CLI), each flushed before and its directory after"]
+EXPECTED_FAILS.update({
+    "publish-flushes-after-the-rename": PUBLISH_AUDITS,
+    "publish-never-flushes-the-file": PUBLISH_AUDITS + ["1b: the manifest's flush fails: the update exits 2 and says which file it could not flush"],
+    "publish-never-flushes-the-directory": PUBLISH_AUDITS + ["1b: the flush of the directory after a rename fails: exit 2 and it says so (the rename is done, the update can be repeated)"],
+    "publish-ignores-a-failed-file-flush": ["1b: the manifest's flush fails: the update exits 2 and says which file it could not flush",
+                                            "1b: the agent's flush fails: exit 2, the agent was not renamed (the installed one is still the old build), and the update says it stopped partway"],
+    "publish-ignores-a-failed-directory-flush": ["1b: the flush of the directory after a rename fails: exit 2 and it says so (the rename is done, the update can be repeated)"],
+    "update-manifest-renamed-without-a-flush": [PUBLISH_AUDITS[1]],
+    "install-manifest-renamed-without-a-flush": [PUBLISH_AUDITS[0]],
+    "install-marker-renamed-without-a-flush": [PUBLISH_AUDITS[0]],
+    "executables-renamed-without-a-flush": PUBLISH_AUDITS,
+    "art-files-renamed-without-a-flush": [PUBLISH_AUDITS[1], SET_AUDIT],
+    "art-set-flushes-the-new-names-after-the-renames": [PUBLISH_AUDITS[1], SET_AUDIT],
+    "art-set-never-flushes-the-directories": [PUBLISH_AUDITS[1], SET_AUDIT_CHUNKED, SET_COUNT, SET_DIR_FAILS],
+    "art-set-ignores-a-failed-file-flush": [SET_FILE_FAILS],
+    "art-set-ignores-a-failed-directory-flush": [SET_DIR_FAILS],   # the art tree flush stops a failing directory too, so CATALOG_WAITS no longer tells the two apart
+    "catalogs-renamed-in-the-pictures-set": [PUBLISH_AUDITS[1], CATALOG_AUDIT, CATALOG_WAITS],
+    "art-set-flushes-each-file-with-its-own-call": [SET_COUNT, SET_CALLS],
+    "art-set-flushes-each-directory-with-its-own-call": [SET_COUNT, SET_CALLS],
+    "art-set-flushes-a-directory-once-per-file": [SET_COUNT, "1c: ... each directory is flushed once by its set and once by the art tree, not once per file"],
+    "art-set-ignores-the-chunk-limit": ["1c: ... three sets (13, 13, 6 files) are 6 perl starts, 9 with the manifest and the art tree, and the audit still holds for each",
+                                        "1c: ... a directory a later set shares with an earlier one is flushed again after the later set (motions/M2: three sets, then the art tree)"],
+    "art-set-chunk-size-unchecked": ["1c: ... zero, a negative number and text are not usable: the default (0 would make the loop take no file and never end)"],
+    "update-manifest-directory-flushed-after-the-art": [PUBLISH_AUDITS[1], MANIFEST_FIRST],
+    "install-manifest-directory-flushed-after-the-art": [PUBLISH_AUDITS[0], INSTALL_MANIFEST_FIRST],
+    # -- Sprint 9 round 3: new pictures go through the set path; the whole art tree is flushed before the catalogs, also on a re-run
+    "new-pictures-copied-to-their-final-names": [NEW_STRAIGHT, ONLY_PARTIAL, NEW_ONE_BY_ONE, PUBLISH_AUDITS[1]],
+    "new-pictures-copied-to-their-final-names-in-the-matrix": [INTERRUPT_ONLY_PARTIAL, INTERRUPT_SETS],
+    "art-tree-never-flushed-before-the-catalogs": [ART_TREE_FLUSH, ART_TREE_ORDER, RERUN_FLUSHES_FIRST, RERUN_ALL_DIRS, RERUN_DIR_FLUSHED],
+    "art-tree-flushed-after-the-catalogs": [ART_TREE_ORDER, RERUN_FLUSHES_FIRST],
+    "art-tree-flushed-only-after-a-set-of-pictures": [RERUN_FLUSHES_FIRST, RERUN_DIR_FLUSHED],
+    "art-tree-flush-failure-ignored": [ART_TREE_FAILS],
+    "art-tree-flush-leaves-out-the-directories": [ART_TREE_FLUSH, RERUN_ALL_DIRS],
+    "art-set-chunk-above-the-cap": [CHUNK_ABOVE],
+    "already-up-to-date-skips-the-art-tree-flush": [UPTODATE_FLUSHES],
+    "update-leaves-the-new-pictures-partial-names-out-of-the-manifest": [NEW_LISTED],
+    "update-leaves-the-new-pictures-partial-names-unrecorded": ["one uninstall exited 2"],
+    "flush-helper-sends-another-command": ["FAIL: install of"],      # every install dies at its first flush, so the suite stops at its first fake install
+    "flush-helper-follows-symlinks": ["1b: helper: a symlink is refused, not followed (exit 1)"],
+    "flush-helper-blocks-on-a-fifo": ["1b: helper: a FIFO is refused at once, it never blocks the CLI waiting for a writer (exit 1 within 5 s)"],
+    "flush-helper-accepts-any-file-type": ["1b: helper: a device is refused (exit 1, 'not a regular file or a directory')"],
+    "flush-helper-ignores-a-refused-command": ["1b: helper: when the kernel refuses the flush command the call fails (exit 1) and says F_FULLFSYNC failed"],
+})
+
+PUBLISH_FILE_FLUSH = '  flush_durable "$1" || die "could not flush $1 to the disk; it was not moved into place"\n'
+PUBLISH_MV = '  mv "$1" "$2" || die "$3"\n'
+PUBLISH_DIR_FLUSH = '  flush_durable "${2%/*}" || die "could not flush ${2%/*} to the disk after moving $2 into place"\n'
+SET_FILE_FLUSH = '    flush_durable "${partials[@]}" || die "could not flush the ${#partials[@]}-copy set starting at ${partials[0]} to the disk; none of it was moved into place"\n'
+SET_MV = '    for name in "${files[@]}"; do mv "$name.partial" "$name" || die "could not move $name into place"; done\n'
+SET_DIR_FLUSH = '    flush_durable "${dirs[@]}" || die "could not flush the directories of the ${#files[@]}-file set starting at ${files[0]} to the disk after moving it into place"\n'
+OPEN_FLAGS = "O_RDONLY | O_NONBLOCK | O_NOFOLLOW"
+CHUNK_CASE = 'case "$FLUSH_CHUNK" in \'\'|*[!0-9]*|0*) FLUSH_CHUNK=400 ;; *) [ "${#FLUSH_CHUNK}" -le 3 ] && [ "$FLUSH_CHUNK" -le 400 ] || FLUSH_CHUNK=400 ;; esac\n'
+FLUSH_ART_TREE = '  flush_durable "$ROOT/art" ${art_dirs[@]+"${art_dirs[@]}"} || die "could not flush the directories of $ROOT/art to the disk; the catalogs, the agent and the CLI were not moved into place"\n'
+FLUSH_UPTODATE = '    flush_durable "$ROOT/art" ${art_dirs[@]+"${art_dirs[@]}"} || die "could not flush the directories of $ROOT/art to the disk (nothing else was changed)"\n'
+PICTURES_LOOP = '  for rel in ${diff_rel[@]+"${diff_rel[@]}"} ${new_rel[@]+"${new_rel[@]}"}; do\n    case "$rel" in */*) batch+=("$rel") ;; esac\n  done\n'
+# the code before this round: a new picture is copied, a directory at a time, straight to its final name
+STRAIGHT_COPY = (
+    '  for rel in ${diff_rel[@]+"${diff_rel[@]}"}; do\n    case "$rel" in */*) batch+=("$rel") ;; esac\n  done\n'
+    '  nb=(); batch_dir=""\n'
+    '  for rel in ${new_rel[@]+"${new_rel[@]}"}; do\n'
+    '    case "$rel" in */*) ;; *) continue ;; esac\n'
+    '    d="${rel%/*}"\n'
+    '    if [ "$d" != "$batch_dir" ] || [ "${#nb[@]}" -ge 100 ]; then\n'
+    '      if [ "${#nb[@]}" -gt 0 ]; then cp -- "${nb[@]}" "$ROOT/art/$batch_dir/" || die "copy failed: $ROOT/art/$batch_dir"; fi\n'
+    '      nb=(); batch_dir="$d"\n'
+    '    fi\n'
+    '    nb+=("$repo/art/$rel")\n'
+    '  done\n'
+    '  if [ "${#nb[@]}" -gt 0 ]; then cp -- "${nb[@]}" "$ROOT/art/$batch_dir/" || die "copy failed: $ROOT/art/$batch_dir"; fi\n')
+CONTROLS.update({
+    "new-pictures-copied-to-their-final-names": (UPDATE, [(PICTURES_LOOP, STRAIGHT_COPY)], {}, []),
+    "new-pictures-copied-to-their-final-names-in-the-matrix": (UPDATE_INTERRUPT, [(PICTURES_LOOP, STRAIGHT_COPY)], {}, []),
+    "art-tree-never-flushed-before-the-catalogs": (UPDATE, [(FLUSH_ART_TREE, '')], {}, []),
+    "art-tree-flushed-after-the-catalogs": (UPDATE, [
+        (FLUSH_ART_TREE, ''),
+        ('  # Each executable is proved by its sha256 before it gets its final name', FLUSH_ART_TREE + '  # Each executable is proved by its sha256 before it gets its final name')], {}, []),
+    "art-tree-flushed-only-after-a-set-of-pictures": (UPDATE, [(FLUSH_ART_TREE, '  if [ "${#batch[@]}" -gt 0 ]; then\n  ' + FLUSH_ART_TREE + '  fi\n')], {}, []),
+    "art-tree-flush-failure-ignored": (UPDATE, [(FLUSH_ART_TREE, '  flush_durable "$ROOT/art" ${art_dirs[@]+"${art_dirs[@]}"} || true\n')], {}, []),
+    "art-tree-flush-leaves-out-the-directories": (UPDATE, [(FLUSH_ART_TREE, '  flush_durable "$ROOT/art" || die "could not flush $ROOT/art"\n')], {}, []),
+    "already-up-to-date-skips-the-art-tree-flush": (UPDATE, [(FLUSH_UPTODATE, '')], {}, []),
+    "publish-flushes-after-the-rename": (UPDATE, [(PUBLISH_FILE_FLUSH + PUBLISH_MV, PUBLISH_MV + '  flush_durable "$2" || die "could not flush $2"\n')], {}, []),
+    "publish-never-flushes-the-file": (UPDATE, [(PUBLISH_FILE_FLUSH, '')], {}, []),
+    "publish-never-flushes-the-directory": (UPDATE, [(PUBLISH_DIR_FLUSH, '')], {}, []),
+    "publish-ignores-a-failed-file-flush": (UPDATE, [(PUBLISH_FILE_FLUSH, '  flush_durable "$1" || true\n')], {}, []),
+    "publish-ignores-a-failed-directory-flush": (UPDATE, [(PUBLISH_DIR_FLUSH, '  flush_durable "${2%/*}" || true\n')], {}, []),
+    "update-manifest-renamed-without-a-flush": (UPDATE, [
+        ('    publish_file "$MANIFEST_PARTIAL" "$MANIFEST" "cannot publish the new manifest"\n', '    mv "$MANIFEST_PARTIAL" "$MANIFEST" || die "cannot publish the new manifest"\n')], {}, []),
+    "install-manifest-renamed-without-a-flush": (UPDATE, [
+        ('  publish_file "$MANIFEST_PARTIAL" "$MANIFEST" "cannot publish the manifest"\n', '  mv "$MANIFEST_PARTIAL" "$MANIFEST" || die "cannot publish the manifest"\n')], {}, []),
+    "install-marker-renamed-without-a-flush": (UPDATE, [
+        ('  publish_file "$MARKER_PARTIAL" "$MARKER" "cannot publish the install marker"\n', '  mv "$MARKER_PARTIAL" "$MARKER" || die "cannot publish the install marker"\n')], {}, []),
+    "executables-renamed-without-a-flush": (UPDATE, [
+        ('  publish_file "$2.partial" "$2" "could not move $2 into place"\n', '  mv "$2.partial" "$2" || die "could not move $2 into place"\n')], {}, []),
+    "art-files-renamed-without-a-flush": (UPDATE, [(SET_FILE_FLUSH, '')], {}, []),
+    "art-set-flushes-the-new-names-after-the-renames": (UPDATE, [(SET_FILE_FLUSH + SET_MV, SET_MV + '    flush_durable "${files[@]}" || die "could not flush the set"\n')], {}, []),
+    "art-set-never-flushes-the-directories": (UPDATE, [(SET_DIR_FLUSH, '')], {}, []),
+    "art-set-ignores-a-failed-file-flush": (UPDATE, [(SET_FILE_FLUSH, '    flush_durable "${partials[@]}" || true\n')], {}, []),
+    "art-set-ignores-a-failed-directory-flush": (UPDATE, [(SET_DIR_FLUSH, '    flush_durable "${dirs[@]}" || true\n')], {}, []),
+    "catalogs-renamed-in-the-pictures-set": (UPDATE, [(
+        '    case "$rel" in */*) batch+=("$rel") ;; esac\n  done\n  if [ "${#batch[@]}" -gt 0 ]; then place_art_files "$repo" "${batch[@]}"; fi\n  # Every directory of the art tree',
+        '    batch+=("$rel")\n  done\n  if [ "${#batch[@]}" -gt 0 ]; then place_art_files "$repo" "${batch[@]}"; fi\n  # Every directory of the art tree')], {}, []),
+    "art-set-flushes-each-file-with-its-own-call": (UPDATE, [(SET_FILE_FLUSH, '    for name in "${partials[@]}"; do flush_durable "$name" || die "could not flush $name"; done\n')], {}, []),
+    "art-set-flushes-each-directory-with-its-own-call": (UPDATE, [(SET_DIR_FLUSH, '    for name in "${dirs[@]}"; do flush_durable "$name" || die "could not flush $name"; done\n')], {}, []),
+    "art-set-flushes-a-directory-once-per-file": (UPDATE, [(
+        '      case "$seen" in *$\'\\n\'"$dir"$\'\\n\'*) ;; *) seen="$seen$dir"$\'\\n\'; dirs+=("$dir") ;; esac\n', '      dirs+=("$dir")\n')], {}, []),
+    "art-set-ignores-the-chunk-limit": (UPDATE, [('    while [ "$#" -gt 0 ] && [ "${#files[@]}" -lt "$FLUSH_CHUNK" ]; do\n', '    while [ "$#" -gt 0 ]; do\n')], {}, []),
+    "art-set-chunk-size-unchecked": (UPDATE, [(CHUNK_CASE, ':\n')], {}, []),
+    "art-set-chunk-above-the-cap": (UPDATE, [(CHUNK_CASE, 'case "$FLUSH_CHUNK" in \'\'|*[!0-9]*|0) FLUSH_CHUNK=400 ;; esac\n')], {}, []),
+    "update-manifest-directory-flushed-after-the-art": (UPDATE, [
+        ('    publish_file "$MANIFEST_PARTIAL" "$MANIFEST" "cannot publish the new manifest"\n',
+         '    flush_durable "$MANIFEST_PARTIAL" || die "could not flush the new manifest"\n    mv "$MANIFEST_PARTIAL" "$MANIFEST" || die "cannot publish the new manifest"\n'),
+        ('  # Each executable is proved by its sha256 before it gets its final name', '  if [ "$added_n" -gt 0 ]; then flush_durable "$ROOT" || die "could not flush $ROOT"; fi\n  # Each executable is proved by its sha256 before it gets its final name')], {}, []),
+    "install-manifest-directory-flushed-after-the-art": (UPDATE, [
+        ('  publish_file "$MANIFEST_PARTIAL" "$MANIFEST" "cannot publish the manifest"\n',
+         '  flush_durable "$MANIFEST_PARTIAL" || die "could not flush the manifest"\n  mv "$MANIFEST_PARTIAL" "$MANIFEST" || die "cannot publish the manifest"\n'),
+        ('  # The settings lock exists from the install on;', '  flush_durable "$ROOT" || die "could not flush $ROOT"\n  # The settings lock exists from the install on;')], {}, []),
+    "flush-helper-sends-another-command": (UPDATE, [("fcntl($fh, 51, 0)", "fcntl($fh, 9999, 0)")], {}, []),
+    "flush-helper-follows-symlinks": (UPDATE, [(OPEN_FLAGS, "O_RDONLY | O_NONBLOCK")], {}, []),
+    "flush-helper-blocks-on-a-fifo": (UPDATE, [(OPEN_FLAGS, "O_RDONLY | O_NOFOLLOW")], {}, []),
+    "flush-helper-accepts-any-file-type": (UPDATE, [("if (!(-f $fh || -d $fh))", "if (0)")], {}, []),
+    "flush-helper-ignores-a-refused-command": (UPDATE, [("if (!defined fcntl($fh, 51, 0))", "if (0)")], {}, []),
+})
+
+
+# ---- amendment R-BUBBLES, the shell-level rows (styles 13-15 in the CLI, the tested Aqua 0.21.4). They run the part of Tests/cli.test.sh up to
+# section 3a, which holds the status and bubble checks. ----
+CLI_3A_ENV = {"CLAWD_TEST_STOP_AFTER": "3a"}
+CONTROLS.update({
+    "cli-bubble-styles-stop-at-twelve": (CLI, [
+        ('      while [ "$s" -le 15 ]; do\n', '      while [ "$s" -le 12 ]; do\n'),
+        ('case "$n" in [1-9]|1[0-5]) ;; *) die "bubble $1 takes a style number from 1 to 15" ;; esac',
+         'case "$n" in [1-9]|1[0-2]) ;; *) die "bubble $1 takes a style number from 1 to 12" ;; esac')], CLI_3A_ENV, []),
+    "cli-bubble-exclude-without-the-lock": (CLI, [
+        ('      lock_control\n      styles="$(excluded_styles)"\n      if [ "$1" = exclude ]; then', '      styles="$(excluded_styles)"\n      if [ "$1" = exclude ]; then')], CLI_3A_ENV, []),
+    "cli-bad-side": (CLI, [
+        ('        below|above|left|right) change_setting "bubble side $n" bubbleSide string "$n" ;;\n        *) die "bubble side takes below, above, left or right" ;;',
+         '        *) change_setting "bubble side $n" bubbleSide string "$n" ;;')], CLI_3A_ENV, []),
+    "cli-tested-aqua-still-0.21.2": (CLI, [('TESTED_AQUA="0.21.4"', 'TESTED_AQUA="0.21.2"')], CLI_3A_ENV, []),
+    # chat view accepts any word: `clawd-pet chat view nonsense` exits 0 and writes it, so the invalid-input loop finds control.json changed.
+    "chat-cli-view-accepts-invalid": (CLI, [
+        ('        chat|terminal|stream) change_setting "chat view $2" chatView string "$2" ;;\n        *) die "chat view must be chat, terminal or stream" ;;',
+         '        *) change_setting "chat view $2" chatView string "$2" ;;')], CLI_3A_ENV, []),
+    # chat folder accepts a relative path: `clawd-pet chat folder .` exits 0 and writes it, so the invalid-input loop finds control.json changed.
+    "sa2-cli-chat-folder-accepts-a-relative-path": (CLI, [
+        ('''      case "${2:-}" in
+        /*) ;;
+        *) die "chat folder takes an absolute path to a folder that exists" ;;
+      esac
+''', '''      case "${2:-}" in
+        *) ;;
+      esac
+''')], CLI_3A_ENV, ["invalid 'chat folder .' exits 2"]),
+    # SA4: `chat claude` takes any word, so a relative path is saved (the reader would ignore it).
+    "sa4-cli-chat-claude-accepts-relative": (CLI, [
+        ('''        /*|"~"|"~/"*) ;;
+        *) die "chat claude takes an absolute path to claude, or one starting with ~/" ;;
+''', '''        *) ;;
+''')], CLI_3A_ENV, ["invalid 'chat claude relative/claude' exits 2"]),
+    # SA4: `chat model` saves a name the agent would not accept.
+    "sa4-cli-chat-model-skips-validation": (CLI, [
+        ('''          printf '%s\\n' "${2:-}" | LC_ALL=C /usr/bin/grep -Eqx '[]A-Za-z0-9._:[-]{1,64}' || die "chat model takes a model name of 1 to 64 letters, digits and . _ : [ ] -, or default"
+''', "")], CLI_3A_ENV, ["invalid 'chat model bad/name' exits 2"]),
+    # SA4: `chat permissions` takes `ask`, a value the reader does not know yet.
+    "sa4-cli-chat-permissions-accepts-ask": (CLI, [
+        ('        deny|bypass) change_setting "chat permissions $2" chatPermissions string "$2" ;;',
+         '        deny|bypass|ask) change_setting "chat permissions $2" chatPermissions string "$2" ;;')], CLI_3A_ENV, ["invalid 'chat permissions ask' exits 2"]),
+    # SA5: `uninstall` leaves the Settings reopen request behind.
+    "sa5-cli-uninstall-keeps-open-settings": (CLI, [
+        ('''    remove_files "$ROOT/open-settings"
+''', '''    :
+''')], CLI_5E_ENV, ["uninstall removed the settings reopen request open-settings, no residue"]),
+    "cli-bubble-exclusions-share-the-old-key": (CLI, [
+        ('      write_control bubbleExcluded json "[$joined]" bubbleExcludedNew json "[$newer]"',
+         '      joined="$(printf \'%s\\n\' "$listed" | grep -E \'^[0-9]+$\' | paste -sd, - || true)"\n      write_control bubbleExcluded json "[$joined]" bubbleExcludedNew json "[]"')], CLI_3A_ENV,
+        ["bubble rollback sequence keeps both keys valid after exclude 13", "bubble rollback sequence keeps both keys valid after exclude 4"]),
+    "cli-bubble-exclusions-normalize-invalid-keys": (CLI, [
+        ('''  printf '%s' "$raw" | /usr/bin/perl -e '
+    local $/; my $raw = <STDIN>;
+    exit unless $raw =~ /^\\s*\\[(.*)\\]\\s*$/s;
+    my $body = $1; exit if $body =~ /^\\s*$/;
+    my @values = split /,/, $body, -1;
+    for my $n (@values) {
+      exit unless $n =~ /^\\s*-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\\s*$/;
+      exit unless $n >= $ARGV[0] && $n <= $ARGV[1] && $n == int($n);
+    }
+    my %styles = map { (0 + $_) => 1 } @values;
+    exit if $ARGV[0] == 1 && keys(%styles) >= 12;
+    print 0 + $_, "\\n" for @values;
+  ' "$2" "$3"''', '''  printf '%s' "$raw" | tr -d '[] \\042\\n' | tr ',' '\\n' | grep -E '^([1-9]|1[0-5])$' ''')], CLI_3A_ENV,
+        ["bubble list rejects the entire invalid old exclusion key: [4,16]", 'bubble list rejects the entire invalid new exclusion key: ["13"]']),
+})
+EXPECTED_FAILS.update({
+    "cli-bubble-styles-stop-at-twelve": ["bubble list prints 15 style lines", "bubble exclude 15"],
+    "cli-bubble-exclude-without-the-lock": ["bubble exclude 13 waits for control.lock and gives up with exit 2 while it is held"],
+    "cli-tested-aqua-still-0.21.2": ["status: no warning for the tested Aqua 0.21.4"],
+    "cli-bad-side": ["invalid 'bubble side up' exits 2"],
+    "chat-cli-view-accepts-invalid": ["invalid 'chat view nonsense' exits 2", "invalid 'chat view nonsense' left control.json byte-identical"],
+})
+# ---- attended history: the focus-violation ledger (round 1) ----------------------------------------------------------------------
+CONTROLS.update({
+    "ledger-line-kind-new": (CLI, [(
+        '    for f in "${files[@]}" "${reserved[@]}" "${partials[@]}" "$MARKER"; do echo "file $f"; done\n',
+        '    for f in "${files[@]}" "${reserved[@]}" "${partials[@]}" "$MARKER"; do if [ "$f" = "$LEDGER" ]; then echo "ledger $f"; else echo "file $f"; fi; done\n')], {"CLAWD_TEST_STOP_AFTER": "2b"}, []),
+    "ledger-count-not-printed": (CLI, [(
+        '      echo "clawd-pet: focus violations recorded: ${ledger_count:-0}, ledger born ${ledger_born:-unknown}"\n', '')], {"CLAWD_TEST_STOP_AFTER": "2b"}, []),
+    "ledger-kept-on-uninstall": (CLI, [(
+        '    [ "$f" = "$MARKER" ] && continue\n    if [ -e "$f" ]; then\n',
+        '    [ "$f" = "$MARKER" ] && continue\n    [ "$f" = "$LEDGER" ] && continue\n    if [ -e "$f" ]; then\n'), (
+        '    [ "$f" = "$MARKER" ] && continue\n    if [ -e "$f" ] || [ -L "$f" ]; then residue+=("$f"); fi\n',
+        '    [ "$f" = "$MARKER" ] && continue\n    [ "$f" = "$LEDGER" ] && continue\n    if [ -e "$f" ] || [ -L "$f" ]; then residue+=("$f"); fi\n'), (
+        '      manifest|agent.log|agent.log.1) ;;\n      *) residue+=("$ROOT/$entry") ;;',
+        '      manifest|agent.log|agent.log.1|focus-violations.log) ;;\n      *) residue+=("$ROOT/$entry") ;;')], {"CLAWD_TEST_STOP_AFTER": "2b"}, []),
+})
+EXPECTED_FAILS.update({
+    "ledger-line-kind-new": ["ledger: the manifest lists the focus-violation ledger and its .partial name as ordinary file lines",
+                             "ledger: no manifest line has a kind an older uninstall would reject"],
+    "ledger-count-not-printed": ["... the line says: focus violations recorded: 2, ledger born"],
+    "ledger-kept-on-uninstall": ["uninstall removes the ledger and prints its violation count and birth first"],
+})
+CONTROLS.update({
+    "ledger-created-before-manifest": (UPDATE_INTERRUPT, [(
+        '  publish_file "$MANIFEST_PARTIAL" "$MANIFEST" "cannot publish the manifest"\n  # The ledger exists only once the manifest names it (an interrupted install with a marker and no manifest can never hold one) and before\n  # the plist: no agent can start without it.\n  create_ledger install\n',
+        '  publish_file "$MANIFEST_PARTIAL" "$MANIFEST" "cannot publish the manifest"\n'), (
+        '  {\n    echo "schema 1"\n', '  create_ledger install\n  {\n    echo "schema 1"\n')], {}, []),
+    "update-recreates-missing-ledger": (UPDATE, [(
+        '  elif [ "$marker_found" = 1 ] || [ "$agent_changed" = 1 ]; then\n    ledger_action=recreate\n',
+        '  elif true; then\n    ledger_action=recreate\n')], {}, []),
+    "update-rewrites-ledger": (UPDATE, [(
+        '    grep -qxF -- "file $LEDGER" "$MANIFEST" || die "refusing: $LEDGER exists and the manifest does not list it; uninstall and install again (nothing was changed)"\n',
+        '    grep -qxF -- "file $LEDGER" "$MANIFEST" || die "refusing: $LEDGER exists and the manifest does not list it; uninstall and install again (nothing was changed)"\n    ledger_action=recreate\n')], {}, []),
+    "adopt-ledger-after-agent-copy": (UPDATE, [(
+        '  if [ "$ledger_action" != none ]; then create_ledger "$ledger_action"; fi\n', ''), (
+        '  if [ "$cli_changed" = 1 ]; then copy_executable "$repo/bin/clawd-pet" "$CLI_PATH" "$(sha256_of "$repo/bin/clawd-pet")"; fi\n',
+        '  if [ "$cli_changed" = 1 ]; then copy_executable "$repo/bin/clawd-pet" "$CLI_PATH" "$(sha256_of "$repo/bin/clawd-pet")"; fi\n  if [ "$ledger_action" != none ]; then create_ledger "$ledger_action"; fi\n')], {}, []),
+    "recreate-labelled-adopt-update": (UPDATE, [(
+        '  elif [ "$marker_found" = 1 ] || [ "$agent_changed" = 1 ]; then\n    ledger_action=recreate\n',
+        '  elif [ "$marker_found" = 1 ] || [ "$agent_changed" = 1 ]; then\n    ledger_action=adopt-update\n')], {}, []),
+    "recreate-requires-marker-only": (UPDATE, [(
+        '  elif [ "$marker_found" = 1 ] || [ "$agent_changed" = 1 ]; then\n    ledger_action=recreate\n',
+        '  elif [ "$marker_found" = 1 ]; then\n    ledger_action=recreate\n')], {}, []),
+    "stale-partial-accepts-a-ledger-line-after-the-logs": (UPDATE_INTERRUPT, [(
+        '      if (p == 0 || k != p - 1 || $0 !~ /^(file|dir) /) { bad = 1; exit }\n',
+        '      if (p == 0 || $0 !~ /^(file|dir) /) { bad = 1; exit }\n')], {}, []),
+})
+EXPECTED_FAILS.update({
+    "ledger-created-before-manifest": ["ledger: install renames the ledger into place after the manifest is published and before the plist is written",
+                                       "install(none) cut at op"],
+    "update-recreates-missing-ledger": ["5g: a listed ledger that is absent is not recreated by an ordinary update"],
+    "update-rewrites-ledger": ["5g: an ordinary update leaves an existing ledger byte-identical"],
+    "adopt-ledger-after-agent-copy": ["5g: adoption: the ledger is born (renamed into place) before the first file copy and before the agent swap"],
+    "recreate-labelled-adopt-update": ["5g: a listed ledger that is absent is recreated while the restart marker exists, with how=recreate"],
+    "recreate-requires-marker-only": ["5g: ... rerunning update recreates the ledger with how=recreate and finishes the adoption"],
+    "stale-partial-accepts-a-ledger-line-after-the-logs": ["a partial whose ledger line follows the first log line is refused as stale"],
+})
+# ---- attended history: the window verdict and the history line (round 1) -----------------------------------------------------------
+def only(*scenarios):
+    return {"CLAWD_TEST_ONLY": "^(" + "|".join(scenarios) + ")$"}
+CONTROLS.update({
+    "attended-ledger-not-required": (ATTENDED, [(
+        '  decide_ledger_gaps\n  # agent.log rotating in the window', '  # agent.log rotating in the window')],
+        only("scn_nr_ledger_not_adopted", "scn_nr_ledger_missing", "scn_nr_ledger_stale_agent"), []),
+    "attended-ledger-violation-ignored": (ATTENDED, [(
+        '  if [ "$v" -gt 0 ]; then fail ledger-violation', '  if false; then fail ledger-violation')],
+        only("scn_fail_ledger_violation_stale_counter", "scn_fail_ledger_violation_in_window_only"), []),
+    "attended-ledger-missing-passes": (ATTENDED, [(
+        '      absent) notrun ledger-missing "the ledger $LEDGER is listed in the manifest and does not exist" ;;', '      absent) ;;')],
+        only("scn_nr_ledger_missing"), []),
+    "attended-log-rotation-gates-verdict": (ATTENDED, [(
+        '  if [ -n "$MENU_GAP" ]; then notrun menu-log-gap', '  if [ "$ROTATED" = 1 ]; then notrun log-rotated "agent.log rotated"; fi\n  if [ -n "$MENU_GAP" ]; then notrun menu-log-gap')],
+        only("scn_pass_rotated_twice_in_window", "scn_nr_rotation"), []),
+    "attended-partial-header-classified-torn-line": (ATTENDED, [(
+        "  for my $l (@parts) { $nviol++ if $l =~ /VIOLATION/; }\n", "  for my $l (@parts) { $nviol++ if $l =~ /VIOLATION/; }\n  $ntorn++ if $hdr eq 'partial';\n")],
+        only("scn_nr_ledger_partial_header", "scn_nr_ledger_partial_header_with_newline"), []),
+    "attended-torn-event-classified-malformed": (ATTENDED, [(
+        '    if ($l =~ /VIOLATION/ || $l =~ /^[0-9]/) { $ntorn++; next; }', '    if ($l =~ /VIOLATION/ || $l =~ /^[0-9]/) { $nunknown++; next; }'), (
+        'if (boot_prefix($tail)) { $tailboot = 1; } else { $ntorn++; }', 'if (boot_prefix($tail)) { $tailboot = 1; } else { $nunknown++; }')],
+        only("scn_fail_ledger_unterminated_non_boot_tail", "scn_fail_ledger_torn_violation_sealed"), []),
+    "attended-ledger-boot-pid-unchecked": (ATTENDED, [(
+        '        if [ -z "$STATUS_PID0" ] || ! has_word "$STATUS_PID0" "$LD0_PIDS"; then', '        if false; then')],
+        only("scn_nr_ledger_stale_agent", "scn_nr_ledger_stale_agent_other_pid"), []),
+    "attended-ledger-prefix-unchecked": (ATTENDED, [(
+        '    LD_CONT=changed\n  fi\n}', '    LD_CONT=ok\n  fi\n}')],
+        only("scn_nr_ledger_changed_in_window", "scn_nr_ledger_header_changed_in_window"), []),
+    "attended-final-read-skipped": (ATTENDED, [(
+        '  ledger_snapshot 1\n  EPOCH_E="$(date +%s)"', '  LD1_STATE=ok; /bin/cp "$WORK/ledger-r0" "$WORK/ledger-r1" 2>/dev/null\n  EPOCH_E="$(date +%s)"')],
+        only("scn_nr_ledger_final_read_fails", "scn_fail_ledger_violation_in_window_only"), []),
+    "attended-notrun-exits-before-fail-scan": (ATTENDED, [(
+        'decide() {\n  local s_changes_seen\n  # ---- FAIL rows ----\n', 'decide() {\n  local s_changes_seen\n  decide_ledger_gaps\n  [ -z "$NOTRUNS" ] || return 0\n  # ---- FAIL rows ----\n')],
+        only("scn_fail_wins_ledger_missing_status_counter", "scn_fail_wins_log1_unreadable_ledger_violation", "scn_fail_ledger_partial_header_plus_violation", "scn_fail_wins_final_read_fails_log_line"), []),
+    "attended-history-gates-verdict": (ATTENDED, [(
+        '  decide_ledger_gaps\n  # agent.log rotating in the window', '  decide_ledger_gaps\n  if [ -n "$HIST_TEXT" ] && [ "$HIST_COMPLETE" != 1 ]; then notrun history-incomplete "$HIST_TEXT"; fi\n  # agent.log rotating in the window')],
+        only("scn_pass_ledger_recreated", "scn_pass_ledger_torn_boot_tail"), []),
+    "attended-hist-ok-gates-log-scan": (ATTENDED, [(
+        '  # Every retained log, whole: a violation is a FAIL wherever it is (D5 step 1), whether or not the install-time proof held.\n  scan_logs\n  LOGS_SCANNED=1\n',
+        '  # Every retained log, whole: a violation is a FAIL wherever it is (D5 step 1), whether or not the install-time proof held.\n  if [ "$HIST_OK" = 1 ]; then scan_logs; LOGS_SCANNED=1; fi\n')],
+        only("scn_old_violation_history_incomplete", "scn_fail_retained_log1_violation_proof_failed"), []),
+    "attended-unreadable-log-treated-as-rotated": (ATTENDED, [(
+        '    scan_one "$LOG1" agent.log.1 || LOG_GAPS="$LOG_GAPS${LOG_GAPS:+ }agent.log.1"', '    scan_one "$LOG1" agent.log.1 || true')],
+        only("scn_nr_ledger_log1_unreadable", "scn_fail_wins_log1_unreadable_ledger_violation"), []),
+    "attended-boot-in-window-ignored": (ATTENDED, [(
+        '        if [ "$LD_CONT" = ok ] && [ "$LD_BOOT_IN_WINDOW" -gt 0 ]; then notrun agent-restarted-in-window', '        if false; then notrun agent-restarted-in-window')],
+        only("scn_nr_ledger_boot_in_window"), []),
+    "attended-history-line-dropped": (ATTENDED, [(
+        '  if [ -n "$HIST_TEXT" ]; then\n    ck_say "attended-check: history: $HIST_TEXT"', '  if false; then\n    ck_say "attended-check: history: $HIST_TEXT"')],
+        only("scn_pass_ledger_rotated_three_times_since_install"), []),
+    "attended-rollback-ignored": (ATTENDED, [(
+        '      $behind++ if $2 > $above;\n', '')],
+        only("scn_fail_ledger_behind_counter", "scn_fail_rollback_then_return"), []),
+})
+EXPECTED_FAILS.update({
+    "attended-ledger-not-required": ["the manifest has no ledger line: verdict NOT RUN", "a listed ledger that was removed: verdict NOT RUN",
+                                     "the running pid has no BOOT because the BOOT write failed (no BOOT bytes): verdict NOT RUN"],
+    "attended-ledger-violation-ignored": ["the ledger holds one VIOLATION, the counter is a stale 0, the logs hold nothing: verdict FAIL",
+                                          "a violation reaches the ledger only, during the window (status and log writes failed): found at the final read: verdict FAIL"],
+    "attended-ledger-missing-passes": ["a listed ledger that was removed: verdict NOT RUN"],
+    "attended-log-rotation-gates-verdict": ["agent.log rotated twice during the window, ledger clean, counter 0, sampling clean: verdict PASS",
+                                            "agent.log is rotated during the window: verdict PASS"],
+    "attended-partial-header-classified-torn-line": ["a partial header (a truncated prefix of the header line), no violation anywhere: verdict NOT RUN",
+                                                     "a truncated header line that was sealed by a newline: verdict NOT RUN"],
+    "attended-torn-event-classified-malformed": ["a valid header then an unterminated tail that is not a BOOT prefix (a cut violation line): verdict FAIL",
+                                                 "a cut violation line that the newline guard sealed: verdict FAIL"],
+    "attended-ledger-boot-pid-unchecked": ["the running pid has no BOOT because the BOOT write failed (no BOOT bytes): verdict NOT RUN",
+                                           "a rolled-back agent: the ledger holds only another pid's BOOT: verdict NOT RUN"],
+    "attended-ledger-prefix-unchecked": ["the ledger is truncated during the window: verdict NOT RUN", "the ledger's header is replaced during the window: verdict NOT RUN"],
+    "attended-final-read-skipped": ["the final ledger read fails: verdict NOT RUN",
+                                    "a violation reaches the ledger only, during the window (status and log writes failed): found at the final read: verdict FAIL"],
+    "attended-notrun-exits-before-fail-scan": ["the ledger is missing and status.json says focusViolations 1: verdict FAIL",
+                                               "agent.log.1 is unreadable and the ledger holds a VIOLATION: verdict FAIL",
+                                               "a partial header plus a complete VIOLATION line: verdict FAIL",
+                                               "the final ledger read fails and agent.log holds a FOCUS_VIOLATION line: verdict FAIL"],
+    "attended-history-gates-verdict": ["a recreated ledger (how=recreate, later birth), clean window: verdict PASS",
+                                       "a valid header, a BOOT for the agent, then an unterminated tail that is a prefix of a BOOT line: verdict PASS"],
+    "attended-hist-ok-gates-log-scan": ["a violation only in a retained agent.log.1, the install-time proof failed: verdict FAIL",
+                                        "a violation only in the retained agent.log, the install-time proof unavailable: verdict FAIL"],
+    "attended-unreadable-log-treated-as-rotated": ["agent.log.1 present but mode 000: verdict NOT RUN"],
+    "attended-boot-in-window-ignored": ["a BOOT is appended during the window: verdict NOT RUN"],
+    "attended-history-line-dropped": ["rotated 3 times: the history line is printed apart from the verdict, with the date and how=install"],
+    "attended-rollback-ignored": ["a BOOT counter above the ledger's VIOLATION lines: verdict FAIL",
+                                  "rollback to a build without the ledger, status advanced to 1, then the new build returns: fail codes [focusViolations-nonzero,ledger-behind-counter]"],
+})
+# ---- attended history round 2, fix 1: evidence before exit (a violation in any retained source is a FAIL even when the window never opened) ----
+CONTROLS.update({
+    "attended-unrun-sources-not-collected": (ATTENDED, [(
+        '    collect_unrun_sources\n    compute_history\n  fi\n  decide\n', '    :\n  fi\n  decide\n')],
+        only("scn_fail_evidence_before_exit_status_truncated", "scn_fail_evidence_before_exit_counter_only",
+             "scn_fail_evidence_before_exit_log_line_not_loaded", "scn_fail_evidence_before_exit_ledger_write_failed"), []),
+    "attended-ledger-fail-needs-window": (ATTENDED, [(
+        '  local v t b\n  # A violation recorded in either read', '  local v t b\n  [ "$WINDOW_RAN" = 1 ] || return 0\n  # A violation recorded in either read')],
+        only("scn_fail_evidence_before_exit_status_truncated", "scn_fail_evidence_before_exit_ledger_write_failed"), []),
+    "attended-unrun-log-scan-skipped": (ATTENDED, [(
+        '  scan_logs\n  LOGS_SCANNED=1\n}\n', '  LOGS_SCANNED=0\n}\n')],
+        only("scn_fail_evidence_before_exit_log_line_not_loaded"), []),
+})
+EXPECTED_FAILS.update({
+    "attended-unrun-sources-not-collected": ["a ledger VIOLATION, then status.json truncated by a careless edit (preflight cannot read it): verdict FAIL",
+                                             "status.json holds focusViolations 1 but lacks displayChangeCount (preflight cannot use it): verdict FAIL",
+                                             "agent.log holds a FOCUS_VIOLATION line and the agent is not loaded: verdict FAIL",
+                                             "status.json says the ledger could not be written and the agent is not loaded: verdict FAIL"],
+    "attended-ledger-fail-needs-window": ["a ledger VIOLATION, then status.json truncated by a careless edit (preflight cannot read it): verdict FAIL"],
+    "attended-unrun-log-scan-skipped": ["agent.log holds a FOCUS_VIOLATION line and the agent is not loaded: verdict FAIL"],
+})
+# ---- attended history round 2, fix 2: the menu rows are evaluated across a rotation; only a generation that is gone is a gap ----
+CONTROLS.update({
+    "attended-menu-rotation-gates-verdict": (ATTENDED, [(
+        '  if [ -n "$MENU_GAP" ]; then notrun menu-log-gap', '  if [ -n "$MENU_GAP" ] || [ "$ROTATED" = 1 ]; then notrun menu-log-gap')],
+        only("scn_m_rotation_during_menu_window"), []),
+    "attended-menu-lines-from-the-new-file-only": (ATTENDED, [(
+        '      menu_cut "$LOG1" "$((LOG_S0 + 1))" "" >> "$dest"\n      menu_cut "$LOG" 1 "$end_s" >> "$dest"', '      menu_cut "$LOG" 1 "$end_s" >> "$dest"')],
+        only("scn_m_rotation_during_menu_window"), []),
+    "attended-menu-gap-ignored": (ATTENDED, [(
+        '  if [ -n "$MENU_GAP" ]; then notrun menu-log-gap', '  if false; then notrun menu-log-gap')],
+        only("scn_m_nr_menu_lines_rotated_away"), []),
+    "attended-menu-poll-sizes-not-continued": (ATTENDED, [(
+        '  size=$((MENU_BASE + size))\n', '')],
+        only("scn_m_fail_menu_stayed_open_after_rotation"), []),
+})
+EXPECTED_FAILS.update({
+    "attended-menu-rotation-gates-verdict": ["m_rotation_during_menu_window: one rotation mid-window, every menu action logged: verdict PASS"],
+    "attended-menu-lines-from-the-new-file-only": ["m_rotation_during_menu_window: one rotation mid-window, every menu action logged: verdict PASS"],
+    "attended-menu-gap-ignored": ["m_nr_menu_lines_rotated_away: the start file's lines are gone before they were read: verdict NOT RUN"],
+    "attended-menu-poll-sizes-not-continued": ["m_fail_menu_stayed_open_after_rotation: verdict FAIL"],
+})
+# ---- attended history round 2, fix 3: agent.log renamed between the check that it exists and its open (an ordinary rotation is not unreadable) ----
+CONTROLS.update({
+    "attended-scan-open-not-retried": (ATTENDED, [(
+        '    if [ ! -e "$file" ] && [ ! -L "$file" ] && [ "$tries" -lt 5 ]; then tries=$((tries + 1)); sleep 0.1; continue; fi\n',
+        '    if false; then tries=$((tries + 1)); sleep 0.1; continue; fi\n')],
+        only("scn_scan_rotation_in_every_pass"), []),
+    "attended-scan-not-repeated-after-rotation": (ATTENDED, [(
+        '    [ "$before" != "$after" ] || break\n    pass=$((pass + 1))\n    [ "$pass" -lt "$LOG_READ_TRIES" ] || break\n', '    break\n')],
+        only("scn_scan_rotation_between_check_and_open"), []),
+})
+CONTROLS.update({
+    # Required: a violation read in one pass is kept when a rotation removes its file before the next pass. Without the highest-of-all-passes
+    # assignment the last pass's zero stands.
+    "attended-scan-evidence-reset-between-passes": (ATTENDED, [(
+        '  FV_RETAINED=$fv; LF_RETAINED=$lf; SYNC_RETAINED=$sync\n', '')],
+        only("scn_scan_evidence_survives_a_rotation_between_passes"), []),
+})
+EXPECTED_FAILS.update({
+    "attended-scan-evidence-reset-between-passes": ["scan: a violation read in one pass survives a rotation that removes its file before the next pass"],
+    "attended-scan-open-not-retried": ["scan: the log rotating at every pass still leaves no log-unreadable gap"],
+    "attended-scan-not-repeated-after-rotation": ["scan: a rename between the check and the open is not an unreadable file"],
+})
+# ---- attended history round 2, fix 4: a torn or unknown ledger line makes the history incomplete ----
+CONTROLS.update({
+    "attended-history-broken-events-complete": (ATTENDED, [(
+        '  [ "$broken" -le 0 ] || reasons="${reasons:+$reasons, }$broken torn or unknown ledger line(s)"\n', '')],
+        only("scn_history_torn_event_is_incomplete", "scn_history_unknown_line_is_incomplete"), []),
+})
+# SA6: the Voice section's CLI verbs. The status row runs sections 1 to 2b of Tests/cli.test.sh, the gate row up to 3a, and the restart line's row
+# runs Tests/update.test.sh, where the restart plumbing is.
+CLI_2B_ENV = {"CLAWD_TEST_STOP_AFTER": "2b"}
+CLI_UPDATE = ("bin/clawd-pet", ["bash", "Tests/update.test.sh"], "cli")
+CONTROLS.update({
+    # `status` without Aqua Voice installed prints the version line and the warning again.
+    "sa6-cli-status-warns-without-aqua": (CLI, [
+        ('  if [ ! -e "$AQUA_INFO_PLIST" ]; then\n    echo "Aqua Voice: not installed"\n    return 0\n  fi\n', '')], CLI_2B_ENV,
+        ["status without Aqua Voice installed says so"]),
+    # `aqua follow extra` is accepted (the third word is ignored). Since SA6-5 the word-count gate refuses it first, so both checks go.
+    "sa6-cli-aqua-follow-extra-accepted": (CLI, [
+        ('if [ "${2:-}" = react ]; then [ $# -le 3 ]; else [ $# -le 2 ]; fi || { usage >&2; exit 2; }', '[ $# -le 3 ] || { usage >&2; exit 2; }'),
+        ('      [ -z "${2:-}" ] || { usage >&2; exit 2; }\n', '')], CLI_3A_ENV,
+        ["invalid 'aqua follow extra' exits 2"]),
+    # SA6-5: the gate counts aqua follow|ignore|auto's words as react's, so an empty third word gets through and the setting is written.
+    "sa6res-cli-aqua-empty-third-word-accepted": (CLI, [
+        ('if [ "${2:-}" = react ]; then [ $# -le 3 ]; else [ $# -le 2 ]; fi || { usage >&2; exit 2; }', '[ $# -le 3 ] || { usage >&2; exit 2; }')],
+        CLI_3A_ENV, ["aqua follow with an empty third word exits 2"]),
+    # With aquaReact false, `aqua follow` prints the "applied" line again instead of what is in effect.
+    "sa6-cli-react-off-message-dropped": (CLI_UPDATE, [
+        ('    if [ "$AQUA_REACT_OFF" = 1 ]; then\n', '    if false; then\n')], {},
+        ["5b: ... and says saved; in effect: ignore (React is off)"]),
+})
+
+EXPECTED_FAILS.update({
+    "attended-history-broken-events-complete": ["a torn event: the history line says incomplete and names the count",
+                                                "unknown lines: the history line says incomplete and names the count"],
+})
+def apply_edits(name):
+    """Control `name`'s file with its edits applied once each, in order, and None; or None and the line that names the first missing anchor."""
+    (relative, _, _), edits, _, _ = CONTROLS[name]
+    altered = (repo / relative).read_text()
+    for before, after in edits:
+        if before not in altered:
+            return None, f"{name}: mutation anchor not found in {relative}: {before[:70]!r}"
+        altered = altered.replace(before, after, 1)
+    return altered, None
+
+
+def run_control(name, output):
+    (relative, command, group), edits, env_extra, expected = CONTROLS[name]
+    if expected == [] and name in EXPECTED_FAILS:
+        expected = EXPECTED_FAILS[name]
+    folder = output / name
+    tree = folder / "tree"
+    target = make_tree(tree, relative)
+    altered, missing = apply_edits(name)
+    if missing:
+        return [missing], False
+    target.write_text(altered)
+    target.chmod((repo / relative).stat().st_mode & 0o777)
+    (folder / "mutation.txt").write_text(f"{relative}\n" + "\n".join(f"- {b}\n+ {a}" for b, a in edits) + "\n")
+    environment = dict(os.environ); environment.update(env_extra)
+    result = subprocess.run(command, cwd=tree, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=environment)
+    (folder / "run.log").write_text(result.stdout)
+    fails = [line for line in result.stdout.splitlines() if line.startswith("FAIL")]
+    summary = [line for line in result.stdout.splitlines() if re.search(r"pass=\d+ fail=\d+$", line)]
+    last = summary[-1] if summary else "(no summary line)"
+    if expected is None:       # identity control: the unmutated copy must pass
+        ok = result.returncode == 0 and bool(summary) and summary[-1].endswith("fail=0")
+        return [f"{name}: rc={result.returncode} {last}", f"IDENTITY-CONTROL: {name} -> {'passes' if ok else 'DOES NOT PASS'}"], ok
+    named = [text for text in expected if any(text in line for line in fails)]
+    ok = result.returncode != 0 and bool(fails) and len(named) == len(expected)
+    shown = "; ".join(fail[:90] for fail in fails[:2])
+    lines = [f"{name}: rc={result.returncode} {last}; first FAIL lines: {shown}"]
+    lines.append(f"NEGATIVE-CONTROL: {name} -> fails" if ok else f"NEGATIVE-CONTROL NOT PROVEN: {name}")
+    return lines, ok
+
+
+def check_anchors(chosen):
+    """--anchors: runs nothing and writes nothing. For every chosen row, applies its edits one after the other to the text of its target file
+    (as run_control does) and requires each `before` to be found, to change the text, and (rows of the attended menu check) to be found exactly
+    once, so that the first occurrence a row replaces is the one it names. A row applies when it names a FAIL line and every edit passes.
+    Exit 0 when every chosen row applies."""
+    found = total = 0
+    problems = []
+    applying = 0
+    for name in chosen:
+        before_problems = len(problems)
+        (relative, command, group), edits, env_extra, expected = CONTROLS[name]
+        if expected == [] and name not in EXPECTED_FAILS:
+            problems.append(f"{name}: no FAIL line is named for this row")
+        text = (repo / relative).read_text()
+        for before, after in edits:
+            total += 1
+            count = text.count(before)
+            if count < 1:
+                problems.append(f"{name}: mutation anchor not found in {relative}: {before[:80]!r}")
+            elif before == after:
+                problems.append(f"{name}: an edit that changes nothing: {before[:80]!r}")
+            elif count > 1 and name.startswith("attended-menu-"):
+                problems.append(f"{name}: anchor found {count} times in {relative} (a menu row needs exactly one): {before[:80]!r}")
+            else:
+                found += 1
+                text = text.replace(before, after, 1)
+        applying += len(problems) == before_problems
+    for line in problems:
+        print(line, file=sys.stderr)
+    print(f"anchors: {found}/{total} found in {len(chosen)} row(s)")
+    print(f"mutation-controls anchors: {applying} of {len(chosen)} control(s) apply")
+    return 0 if not problems else 1
+
+
+def main(argv):
+    args, out, jobs, group, names, anchors = list(argv), repo / ".evidence" / "r3" / "negative-controls" / "shell", 1, "all", [], False
+    while args:
+        item = args.pop(0)
+        if item == "--anchors":
+            anchors = True
+        elif item == "--out":
+            out = Path(args.pop(0)).resolve()
+        elif item == "--jobs":
+            jobs = int(args.pop(0))
+        elif item == "--group":
+            group = args.pop(0)
+        else:
+            names.append(item)
+    unknown = [n for n in names if n not in CONTROLS]
+    if unknown:
+        print("unknown control(s): " + ", ".join(unknown), file=sys.stderr); return 2
+    chosen = names or [n for n, spec in CONTROLS.items() if group in ("all", spec[0][2])]
+    if anchors:   # only that every chosen row still applies to today's files; no suite runs, nothing is written
+        return check_anchors(chosen)
+    output = out / f"run-{int(time.time())}"
+    output.mkdir(parents=True, exist_ok=False)
+    lock = threading.Lock()
+    kept = []
+
+    def one(name):
+        lines, ok = run_control(name, output)
+        with lock:
+            for line in lines:
+                kept.append(line)
+                print(line, file=sys.stdout if "NOT PROVEN" not in line and "DOES NOT" not in line else sys.stderr, flush=True)
+        return ok
+
+    with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+        results = list(pool.map(one, chosen))
+    commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True).stdout.strip()
+    header = [f"mutation-controls run {time.strftime('%Y-%m-%d %H:%M:%S')} commit {commit or 'unknown'}: {len(chosen)} control(s), {sum(1 for r in results if r)} proven, {sum(1 for r in results if not r)} not proven"]
+    (output / "summary.txt").write_text("\n".join(header + sorted(kept)) + "\n")
+    return 0 if all(results) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,4 @@
+#!/bin/sh
+echo "PID 99999 1 1"
+echo "OWN-PIDS 0"
+exit 0

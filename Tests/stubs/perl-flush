@@ -1,0 +1,23 @@
+#!/bin/sh
+# Stands in for /usr/bin/perl in the CLI's durable-publication helper (CLAWD_FLUSH_PERL): the CLI runs `perl -e SCRIPT -- PATH...` to flush
+# each path to the disk. This stub appends one line "flush-call <number of paths>" per perl start, then one line "flush <path>" per path, to
+# OPSHIM_LOG, in the order the paths arrive and in the same file the PATH shims write their "<n> mv <a> <b>" lines to, so a test reads the
+# order of the flushes and the renames from one log, and counts the perl starts. Then it runs the real perl with the same arguments, so the
+# real flush still happens.
+#   OPSHIM_LOG              the log to append to (nothing is logged without it)
+#   STUB_FLUSH_FAIL         a substring: when a path contains it the stub logs "flush-failed <path>", says so, and exits 1 without flushing anything
+#   STUB_FLUSH_FAIL_EXACT   the same for one whole path
+real=/usr/bin/perl
+[ "${1:-}" = -e ] || exec "$real" "$@"
+script="$2"
+shift 3                    # -e SCRIPT --
+[ -z "${OPSHIM_LOG:-}" ] || printf 'flush-call %s\n' "$#" >> "$OPSHIM_LOG"
+for p in "$@"; do
+  [ -z "${OPSHIM_LOG:-}" ] || printf 'flush %s\n' "$p" >> "$OPSHIM_LOG"
+  if { [ -n "${STUB_FLUSH_FAIL:-}" ] && case "$p" in *"$STUB_FLUSH_FAIL"*) true ;; *) false ;; esac; } || [ "$p" = "${STUB_FLUSH_FAIL_EXACT:--}" ]; then
+    [ -z "${OPSHIM_LOG:-}" ] || printf 'flush-failed %s\n' "$p" >> "$OPSHIM_LOG"
+    echo "flush: stub failure for $p" >&2
+    exit 1
+  fi
+done
+exec "$real" -e "$script" -- "$@"

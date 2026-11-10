@@ -1,0 +1,5 @@
+#!/bin/sh
+# Copies the built agent, art and CLI into place and writes the LaunchAgent plist. Starts nothing. If it is interrupted, run scripts/uninstall.
+set -eu
+repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+exec /bin/bash "$repo/bin/clawd-pet" install

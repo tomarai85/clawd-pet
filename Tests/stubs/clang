@@ -1,0 +1,5 @@
+#!/bin/sh
+# A compiler that must never run: install copies the checked-in launcher and never builds one. Any call is recorded and fails.
+# (Tests/stubs/cc and Tests/stubs/swiftc are the same program under other names.)
+echo "$(basename "$0") $*" >> "${STUB_CC_LOG:-/dev/null}"
+exit 99

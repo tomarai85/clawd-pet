@@ -1,0 +1,159 @@
+#!/bin/bash
+# Stub of clawd-attended-sampler (Sources/ClawdAttendedSampler) for the attended-check and post-install-check tests. It reads and
+# writes only the scenario directory $STUB_DIR and files a scenario names; no window, process list or frontmost read is involved.
+#
+#   windows        prints the window list of the Nth call: $STUB_DIR/windows.N, or the highest-numbered file below N, then the footer
+#                  "WINDOWS <n>". windows.fail.N makes the Nth call exit 2; windows.truncated.N prints no footer.
+#                  Every call also appends the pids of $STUB_DIR/windows.dynamic.* (one file per process that asked to appear).
+#                  $STUB_DIR/windows.delay (seconds) makes every `windows` call take that long first: a lister slower than the program it watches;
+#                  windows.delay.N does the same for the Nth call only (a read that is slow once). The list is made AFTER the delay, so it shows
+#                  the windows as they are when the call returns. $STUB_DIR/windows.hook.N is a shell command run at the start of the Nth call
+#                  (before its delay): a status.json change during the panel re-read at the end of the attended window. The hook gets
+#                  CLAWD_STUB_LISTER_PARENT, the pid of the process that asked for the list (bash's own $PPID, no process listing).
+#   sample S MS    prints "SAMPLING pid=<own>", then one line "<ms> <front pid>" per tick with a SYNTHETIC clock that starts at
+#                  100000 and advances by MS per line (so a loaded machine never makes a gap), paced by real sleeps of 20 ms, until
+#                  SIGTERM/SIGINT (then "SAMPLES-WRITTEN n"; with $STUB_DIR/sampler.term-delay holding seconds, it first waits that
+#                  long and writes one last sample, as a sampler that flushes its last lines on the way out) or STUB_MAX_SAMPLES lines.
+#                  The frontmost pid starts as the content of
+#                  $STUB_DIR/front.start. $STUB_DIR/scenario holds lines "<sample index> <action> <arguments>":
+#                    front PID    the frontmost pid from this sample on (-1 = unreadable); the "system" (see lsappinfo-front) follows it
+#                    world PID    the system's frontmost pid changes, the sampler keeps printing the old one (a cached, stale value)
+#                    sampler PID  the sampler prints PID from this sample on and the system's answer stays as it was: a switch that only
+#                                 the sampler caught, between two independent looks
+#                    gap MS       the synthetic clock jumps MS before this sample
+#                    shell CMD    run CMD (the user's clicks: append INPUT lines to agent.log; rotate it; change status.json)
+#                    stall        keep running but print nothing more
+#                    die          exit at once with no footer
+#                  With the argument `clicks` (sample S MS clicks) the stub prints "CLICKS-ON pid=<own>" on stderr, like the real sampler, and
+#                  the actions of the menu check are available (every time is on the synthetic clock, `$ms` below; the argument vector of the
+#                  call is kept in $STUB_DIR/sampler.args, so a test can see whether `clicks` was passed):
+#                    click BUTTON X Y CTRL ET       a CLICK line on stderr: t is the clock now, et is ET (the time of the physical click)
+#                    geom BUBBLE STAGE HIT BODY MENU MENUGEN [keepwindow|nowindow|windowlater MS]
+#                                                   a GEOM line in agent.log (t = the clock now); with a menu rectangle it also creates
+#                                                   $STUB_DIR/windows.dynamic.menu, an on-screen window of the agent with the menu's x, y, w
+#                                                   and h (which the `windows` command appends to every list); with `none` it removes the file.
+#                                                   keepwindow: do not remove it; nowindow: do not create it; windowlater MS: create it MS later
+#                    menu REST                      the agent log line "MENU REST"
+#                    agent REST                     any agent log line, verbatim
+#                    late MS ACTION ARGS...         run ACTION when the clock is MS later (an agent line that comes late, a CLICK the sampler
+#                                                   handles late: its t is the clock then, its et is the one given)
+#                    key MS LINE                    the keys stub (Tests/attended-stubs/keys) prints LINE when the clock is MS later
+#                  Agent log lines carry an epoch prefix (1792000000.<sequence>), like the agent's.
+#                  $STUB_DIR/sampler.fail makes `sample` exit 3 at once.
+case "${1:-}" in
+  windows)
+    n=$(( $(cat "$STUB_DIR/windows.count" 2>/dev/null || echo 0) + 1 ))
+    echo "$n" > "$STUB_DIR/windows.count"
+    [ ! -f "$STUB_DIR/windows.hook.$n" ] || CLAWD_STUB_LISTER_PARENT="$PPID" bash "$STUB_DIR/windows.hook.$n"
+    [ ! -f "$STUB_DIR/windows.delay" ] || sleep "$(cat "$STUB_DIR/windows.delay")"
+    [ ! -f "$STUB_DIR/windows.delay.$n" ] || sleep "$(cat "$STUB_DIR/windows.delay.$n")"
+    [ ! -f "$STUB_DIR/windows.fail.$n" ] || exit 2
+    k=$n
+    while [ "$k" -ge 1 ] && [ ! -f "$STUB_DIR/windows.$k" ]; do k=$((k - 1)); done
+    body=""
+    [ "$k" -lt 1 ] || body="$(cat "$STUB_DIR/windows.$k")"
+    for f in "$STUB_DIR"/windows.dynamic.*; do
+      [ -f "$f" ] || continue
+      body="$body${body:+
+}$(cat "$f")"
+    done
+    [ -z "$body" ] || printf '%s\n' "$body"
+    if [ ! -f "$STUB_DIR/windows.truncated.$n" ]; then
+      printf 'WINDOWS %s\n' "$(printf '%s' "$body" | grep -c '^WINDOW ')"
+    fi
+    exit 0 ;;
+  sample)
+    [ ! -f "$STUB_DIR/sampler.fail" ] || { echo "stub sampler: told to fail" >&2; exit 3; }
+    printf '%s\n' "$*" > "$STUB_DIR/sampler.args"
+    interval="${3:-20}"
+    idx=(); act=(); arg=(); fired=()
+    pdue=(); pact=(); parg=(); pdone=()
+    agentlog="$HOME/Library/Application Support/clawd-pet/agent.log"
+    agent_line() { # TEXT: one agent log line with the epoch prefix
+      local seq
+      seq=$(( $(cat "$STUB_DIR/line.seq" 2>/dev/null || echo 0) + 1 )); echo "$seq" > "$STUB_DIR/line.seq"
+      printf '1792000000.%06d %s\n' "$((seq + 100))" "$1" >> "$agentlog"
+    }
+    clock_s() { printf '%d.%03d' "$((ms / 1000))" "$((ms % 1000))"; }
+    menu_window() { # x,y,w,h: the menu window of the scenario's agent, on screen
+      local x y w h pid
+      IFS=, read -r x y w h <<< "$1"
+      pid="$(cat "$STUB_DIR/launchctl.1" 2>/dev/null)"
+      printf 'WINDOW %s 3 1 %s %s %s %s 53\n' "$pid" "$x" "$y" "$w" "$h" > "$STUB_DIR/windows.dynamic.menu"
+    }
+    run_action() { # ACTION ARGUMENTS: one scenario action at the clock now
+      local a="$1" r="$2" bubble stage hit body menurect menugen mod modarg rest lms lact larg
+      case "$a" in
+        front) front="$r"; [ "$front" = -1 ] || echo "$front" > "$STUB_DIR/front.now" ;;
+        world) echo "$r" > "$STUB_DIR/front.now" ;;
+        sampler) front="$r" ;;
+        gap) ms=$((ms + r)) ;;
+        shell) eval "$r" ;;
+        stall) stalled=1 ;;
+        die) exit 0 ;;
+        click)
+          set -- $r
+          printf 'CLICK t=%s et=%s button=%s ctrl=%s x=%s y=%s target=none\n' "$(clock_s)" "$5" "$1" "$4" "$2" "$3" >&2 ;;
+        menu) agent_line "MENU $r" ;;
+        agent) agent_line "$r" ;;
+        geom)
+          set -- $r
+          bubble="$1"; stage="$2"; hit="$3"; body="$4"; menurect="$5"; menugen="$6"; mod="${7:-}"; modarg="${8:-}"
+          agent_line "GEOM t=$(clock_s) bubble=$bubble stage=$stage hit=$hit body=$body menu=$menurect menugen=$menugen"
+          if [ "$menurect" != none ]; then
+            case "$mod" in
+              nowindow) ;;
+              windowlater) pdue+=("$((ms + modarg))"); pact+=(mkwindow); parg+=("$menurect"); pdone+=(0) ;;
+              *) menu_window "$menurect" ;;
+            esac
+          else
+            [ "$mod" = keepwindow ] || rm -f -- "$STUB_DIR/windows.dynamic.menu"
+          fi ;;
+        mkwindow) menu_window "$r" ;;
+        late)
+          lms="${r%% *}"; rest="${r#* }"; lact="${rest%% *}"; larg=""
+          case "$rest" in *" "*) larg="${rest#* }" ;; esac
+          pdue+=("$((ms + lms))"); pact+=("$lact"); parg+=("$larg"); pdone+=(0) ;;
+        key) echo "$((ms + ${r%% *})) ${r#* }" >> "$STUB_DIR/keys.queue" ;;
+      esac
+    }
+    if [ -f "$STUB_DIR/scenario" ]; then
+      # stable by sample index (actions of one index keep the file's order), so a tick looks at the next entry only
+      while IFS= read -r line; do
+        case "$line" in ''|'#'*) continue ;; esac
+        i="${line%% *}"; rest="${line#* }"
+        idx+=("$i"); act+=("${rest%% *}"); arg+=("${rest#* }"); fired+=(0)
+      done < <(grep -v -e '^$' -e '^#' "$STUB_DIR/scenario" | sort -s -n -k1,1)
+    fi
+    nextj=0
+    k=0; ms=100000; front="$(cat "$STUB_DIR/front.start")"; max="${STUB_MAX_SAMPLES:-3000}"; stalled=0
+    cp "$STUB_DIR/front.start" "$STUB_DIR/front.now"
+    trap '[ ! -s "$STUB_DIR/sampler.term-delay" ] || { sleep "$(cat "$STUB_DIR/sampler.term-delay")"; echo "$ms $front"; k=$((k + 1)); }; echo "SAMPLES-WRITTEN $k"; exit 0' TERM INT
+    echo "SAMPLING pid=$$"
+    [ "${4:-}" != clicks ] || echo "CLICKS-ON pid=$$" >&2
+    while [ "$k" -lt "$max" ]; do
+      while [ "$nextj" -lt "${#idx[@]}" ] && [ "${idx[$nextj]}" -le "$k" ]; do
+        [ "${idx[$nextj]}" != "$k" ] || run_action "${act[$nextj]}" "${arg[$nextj]}"
+        nextj=$((nextj + 1))
+      done
+      if [ "${#pdue[@]}" -gt 0 ]; then
+        j=0
+        while [ "$j" -lt "${#pdue[@]}" ]; do
+          if [ "${pdone[$j]}" = 0 ] && [ "$ms" -ge "${pdue[$j]}" ]; then
+            pdone[$j]=1
+            run_action "${pact[$j]}" "${parg[$j]}"
+          fi
+          j=$((j + 1))
+        done
+      fi
+      if [ "$stalled" = 0 ]; then
+        echo "$ms $front"
+        ms=$((ms + interval))
+        k=$((k + 1))
+      fi
+      sleep 0.02
+    done
+    exit 0 ;;
+esac
+echo "stub sampler: unknown command" >&2
+exit 2

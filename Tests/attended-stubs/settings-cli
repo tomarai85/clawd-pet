@@ -1,0 +1,45 @@
+#!/bin/bash
+# Stand-in for `clawd-pet` and for the running agent behind it, for the settings-step tests (scripts/post-install-settings-step.sh).
+# `settings-cli walk on|off` does what the real CLI and a healthy agent do together: it raises `generation` in control.json, sets `walk`,
+# writes the agent's `appliedGeneration` to status.json and appends the agent's log lines
+#     <epoch> SETTINGS applied generation=<n>        <epoch> WALK disabled|enabled
+# and exits 0. $STUB_DIR/cli.mode says how it misbehaves, and applies to every call unless cli.mode.N exists for the Nth call:
+#   ok              as above
+#   unconfirmed     saved, but the agent never reports it: no status, no log lines, exit 3
+#   stale-status    exit 0, but status.json keeps the old appliedGeneration (the CLI lied)
+#   no-settings     the WALK line only
+#   no-walk         the SETTINGS line only
+#   wrong-order     the WALK line before the SETTINGS line
+#   late-log        the log lines arrive 0.6 s after the CLI returned
+#   restart         the job's pid changes (the next launchctl answer names 5555)
+#   sleep           sleeps 1.5 s first, then behaves as ok (an interrupt arrives while it runs)
+# Every call is recorded in $STUB_DIR/cli.calls.
+[ "${1:-}" = walk ] && { [ "${2:-}" = on ] || [ "${2:-}" = off ]; } || { echo "settings-cli: unexpected arguments: $*" >> "$STUB_DIR/cli.violations"; exit 2; }
+root="$HOME/Library/Application Support/clawd-pet"
+n=$(( $(cat "$STUB_DIR/cli.count" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$STUB_DIR/cli.count"
+echo "walk $2" >> "$STUB_DIR/cli.calls"
+mode="$(cat "$STUB_DIR/cli.mode.$n" 2>/dev/null || cat "$STUB_DIR/cli.mode" 2>/dev/null || echo ok)"
+[ "$mode" != sleep ] || { sleep 1.5; mode=ok; }
+gen="$(/usr/bin/plutil -extract generation raw -o - "$root/control.json" 2>/dev/null)"
+case "$gen" in ''|*[!0-9]*) gen=0 ;; esac
+gen=$((gen + 1))
+if [ "$2" = on ]; then value=true; word=enabled; else value=false; word=disabled; fi
+/usr/bin/plutil -convert json -o "$root/control.json.partial" "$root/control.json" && /usr/bin/plutil -replace walk -bool "$value" "$root/control.json.partial" \
+  && /usr/bin/plutil -replace generation -integer "$gen" "$root/control.json.partial" && mv "$root/control.json.partial" "$root/control.json" || exit 2
+settings_line="1792000000.$(printf '%06d' "$n") SETTINGS applied generation=$gen"
+walk_line="1792000000.$(printf '%06d' "$((n + 500))") WALK $word"
+case "$mode" in
+  unconfirmed) exit 3 ;;
+  stale-status) ;;
+  *) printf '{"focusViolations":0,"appliedGeneration":%s}\n' "$gen" > "$root/status.json" ;;
+esac
+case "$mode" in
+  ok|stale-status|restart) printf '%s\n%s\n' "$settings_line" "$walk_line" >> "$root/agent.log" ;;
+  no-settings) printf '%s\n' "$walk_line" >> "$root/agent.log" ;;
+  no-walk) printf '%s\n' "$settings_line" >> "$root/agent.log" ;;
+  wrong-order) printf '%s\n%s\n' "$walk_line" "$settings_line" >> "$root/agent.log" ;;
+  late-log) ( sleep 0.6; printf '%s\n%s\n' "$settings_line" "$walk_line" >> "$root/agent.log" ) >/dev/null 2>&1 & ;;
+esac
+if [ "$mode" = restart ]; then echo 5555 > "$STUB_DIR/launchctl.$(( $(cat "$STUB_DIR/launchctl.count" 2>/dev/null || echo 0) + 1 ))"; fi
+exit 0

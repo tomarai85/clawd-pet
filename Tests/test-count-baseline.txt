@@ -1,0 +1,20 @@
+# Test counts per `swift test --filter <Suite>` on main 7818074 (measured 2026-10-23 with scripts/test-filter.sh <Suite> 0, before any other change).
+# The spec names 66669d7; main has since gained only test edits (SchedulerRulesTests, SchedulerScenarios2, Sprint11PointerTests, BubbleDesignTests,
+# FileAndParserTests), so the baseline is taken on 7818074. A filter is a substring match: Scene includes SceneTiming, Scheduler includes SchedulerFeelClick.
+# Read by scripts/test-filter.sh <Suite> @baseline. Lines: Suite=count.
+FocusLayer=13
+ClickThrough=19
+MenuRuntime=33
+SchedulerFeelClick=13
+SceneTiming=14
+Scheduler=132
+Scene=60
+# Sprint T1 (branch v3-chat-terminal), the suites it adds; counted as the filter runs them.
+ChatTermSpawn=14
+ChatTermGuard=7
+ChatTermStart=3
+ChatTermIO=16
+ChatTermIdle=6
+ChatTermTitle=1
+ChatTermAudit=1
+ChatSettings_chatView=1

@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "OWN-PIDS enumeration failed" >&2
+exit 2

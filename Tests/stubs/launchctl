@@ -1,0 +1,30 @@
+#!/bin/sh
+# Stub for the CLI test: records every call and simulates a service that is loaded after bootstrap.
+# STUB_BOOTOUT_POLLS=N (default 0) makes bootout asynchronous, as launchd's is: after a bootout the label is still listed for the next
+# N `list` calls and is gone from the one after that. N=0 unloads at once.
+echo "launchctl $*" >> "$STUB_LOG"
+# Which interpreter ran the CLI that called this stub (its parent), recorded for the test that pins the CLI to /bin/bash 3.2.
+[ -z "${STUB_SHELL_LOG:-}" ] || /bin/ps -o comm= -p "$PPID" >> "$STUB_SHELL_LOG"
+case "$1" in
+  list)
+    # STUB_LIST_RC=N makes every `list` a failed look (exit N, neither 0 nor 113), whatever the job's state.
+    if [ -n "${STUB_LIST_RC:-}" ]; then echo "Could not list: Input/output error" >&2; exit "$STUB_LIST_RC"; fi
+    if [ -f "$STUB_STATE" ]; then
+      if [ -f "$STUB_STATE.pending" ]; then
+        left=$(cat "$STUB_STATE.pending")
+        if [ "$left" -le 0 ]; then rm -f "$STUB_STATE" "$STUB_STATE.pending"; exit 113; fi
+        echo $((left - 1)) > "$STUB_STATE.pending"
+      fi
+      printf '{\n\t"LimitLoadToSessionType" = "Aqua";\n\t"Label" = "com.tomtim.clawd-pet";\n\t"OnDemand" = false;\n\t"LastExitStatus" = 0;\n\t"PID" = 4242;\n};\n'
+      exit 0
+    fi
+    exit 113 ;;
+  bootstrap) rm -f "$STUB_STATE.pending"; : > "$STUB_STATE"; exit 0 ;;
+  bootout)
+    if [ -f "$STUB_STATE" ]; then
+      n="${STUB_BOOTOUT_POLLS:-0}"
+      if [ "$n" -gt 0 ]; then echo "$n" > "$STUB_STATE.pending"; else rm -f "$STUB_STATE" "$STUB_STATE.pending"; fi
+    fi
+    exit 0 ;;
+esac
+exit 0

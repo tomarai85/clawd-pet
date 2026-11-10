@@ -1,0 +1,5 @@
+#!/bin/sh
+# Records every invocation, then runs the real enumeration of the installed agent.
+echo "$*" >> "$STUB_OWN_LOG"
+[ -z "${STUB_SHELL_LOG:-}" ] || /bin/ps -o comm= -p "$PPID" >> "$STUB_SHELL_LOG"
+exec "$HOME/Library/Application Support/clawd-pet/bin/clawd-pet-agent" "$@"

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stub for the CLI test: `open` must never be called by the CLI; any call is recorded and fails the test.
+echo "open $*" >> "$STUB_OPEN_LOG"
+exit 0

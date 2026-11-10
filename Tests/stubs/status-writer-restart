@@ -1,0 +1,36 @@
+#!/bin/sh
+# Stand-in for the RUNNING agent's settings applier in the restart tests (the real one is AgentRuntime.settingsApplied). Like the agent it
+# compares the restart-only keys of control.json with the values it started with and, when one differs, writes `restartRequired`
+# and `restartGeneration` to status.json instead of confirming the generation; with none differing it confirms the generation.
+#   status-writer-restart ROOT PID
+# PID is the pid it reports (the job's pid). It runs until the test that started it stops it, by the pid the test recorded.
+root="${1:?root}"; pid="${2:?pid}"
+keys_now() { # the four restart-only keys, one per line "name=value"
+  for k in overFullScreen releaseHintsEnabled selectedInputKeyPath idleBudgetMode aqua aquaReact; do
+    printf '%s=%s\n' "$k" "$(/usr/bin/plutil -extract "$k" raw -o - "$root/control.json" 2>/dev/null)"
+  done
+}
+generation() { g="$(/usr/bin/plutil -extract generation raw -o - "$root/control.json" 2>/dev/null)"; case "$g" in ''|*[!0-9]*) g=0 ;; esac; echo "$g"; }
+boot="$(keys_now)"
+applied="$(generation)"
+status_new() { cat > "$root/status.json.new" && mv "$root/status.json.new" "$root/status.json"; }
+printf '{"focusViolations":0,"pid":%s,"appliedGeneration":%s}\n' "$pid" "$applied" | status_new
+last="$applied"
+while :; do
+  gen="$(generation)"
+  if [ "$gen" -ne "$last" ]; then
+    differing=""
+    now="$(keys_now)"
+    for k in overFullScreen releaseHintsEnabled selectedInputKeyPath idleBudgetMode aqua aquaReact; do
+      a="$(printf '%s\n' "$boot" | sed -n "s/^$k=//p")"; b="$(printf '%s\n' "$now" | sed -n "s/^$k=//p")"
+      [ "$a" = "$b" ] || differing="$differing${differing:+,}\"$k\""
+    done
+    if [ -z "$differing" ]; then
+      printf '{"focusViolations":0,"pid":%s,"appliedGeneration":%s}\n' "$pid" "$gen" | status_new; applied="$gen"
+    else
+      printf '{"focusViolations":0,"pid":%s,"appliedGeneration":%s,"restartRequired":[%s],"restartGeneration":%s}\n' "$pid" "$applied" "$differing" "$gen" | status_new
+    fi
+    last="$gen"
+  fi
+  sleep 0.02
+done

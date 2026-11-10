@@ -1,0 +1,20 @@
+#!/bin/bash
+# Stub launchctl for the attended-check and post-install-check tests. Only `list <label>` is ever called by those scripts; anything
+# else is recorded as a violation in $STUB_DIR/launchctl.violations (the tests assert the file is empty).
+# The answer of the Nth `list` call is the content of $STUB_DIR/launchctl.N, or of the highest-numbered file below N:
+#   a number   the job is loaded and runs with that pid
+#   nopid      loaded, no process
+#   unloaded   not loaded (exit 113)
+echo "launchctl $*" >> "$STUB_DIR/launchctl.calls"
+if [ "${1:-}" != "list" ]; then echo "launchctl $*" >> "$STUB_DIR/launchctl.violations"; exit 0; fi
+n=$(( $(cat "$STUB_DIR/launchctl.count" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$STUB_DIR/launchctl.count"
+k=$n
+while [ "$k" -ge 1 ] && [ ! -f "$STUB_DIR/launchctl.$k" ]; do k=$((k - 1)); done
+[ "$k" -ge 1 ] || exit 113
+state="$(cat "$STUB_DIR/launchctl.$k")"
+case "$state" in
+  unloaded) exit 113 ;;
+  nopid) printf '{\n\t"Label" = "com.tomtim.clawd-pet";\n\t"LastExitStatus" = 0;\n};\n'; exit 0 ;;
+  *) printf '{\n\t"Label" = "com.tomtim.clawd-pet";\n\t"LastExitStatus" = 0;\n\t"PID" = %s;\n};\n' "$state"; exit 0 ;;
+esac

@@ -1,0 +1,1703 @@
+#!/bin/bash
+# clawd-pet: control CLI for the Clawd dictation pet.
+# It talks to launchd through launchctl only. It never uses `open`, pgrep or pkill, and never removes a directory tree.
+# help and status work from the repo and from the installed copy, with or without an install.
+set -u
+export LC_ALL=C
+
+LABEL="com.tomtim.clawd-pet"
+ROOT="$HOME/Library/Application Support/clawd-pet"
+AGENT="$ROOT/bin/clawd-pet-agent"
+# The program the LaunchAgent names. It is a frozen, checked-in binary that execs $AGENT, so a rebuilt agent never changes what macOS
+# tracks as the background item (launcher/launcher.c, scripts/build-launcher). install copies it and never builds it.
+LAUNCHER="$ROOT/bin/clawd-pet-launch"
+# The settings files. Every writer takes an exclusive flock(2) on $CONTROL_LOCK (created by install, never replaced or removed by a
+# writer) and replaces $CONTROL only while holding it, through $CONTROL_PARTIAL and a rename.
+CONTROL="$ROOT/control.json"
+CONTROL_LOCK="$ROOT/control.lock"
+CONTROL_PARTIAL="$ROOT/control.json.partial"
+LOCKF="/usr/bin/lockf"
+CONTROL_LOCK_WAIT_S="${CLAWD_CONTROL_LOCK_WAIT_S:-10}"   # a test shortens it; production waits 10 s
+APPLY_WAIT_MS=2000
+UNLOAD_WAIT_STEPS=100
+CLI_PATH="$HOME/bin/clawd-pet"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+MANIFEST="$ROOT/manifest"
+MANIFEST_PARTIAL="$ROOT/manifest.partial"
+# Written by an update that must restart the agent, before it copies its first file, and removed only once the restart is confirmed (or the
+# agent is not running): while it exists the running agent may still hold the old agent, catalogs and pictures in memory, so a plain
+# `clawd-pet update` restarts it even when every file on disk is already current. install lists it in the manifest; update adds the line to
+# an older manifest before it creates the file.
+RESTART_MARKER="$ROOT/restart-pending"
+# The focus-violation ledger: append-only, written by the agent (one BOOT line per start, one VIOLATION line per focus violation) and read by
+# scripts/attended-check.sh. install creates it with its header line, after the manifest (which lists it as an ordinary `file`, so every
+# build's uninstall understands it) and before the LaunchAgent plist exists; update adopts it into an older install; uninstall removes it
+# and prints the number of violations it held.
+LEDGER="$ROOT/focus-violations.log"
+LEDGER_PARTIAL="$LEDGER.partial"
+# Ownership record outside $ROOT: written first by install (one line, root-created yes|no), removed last by uninstall.
+MARKER="$HOME/Library/Application Support/clawd-pet.installing"
+MARKER_PARTIAL="$MARKER.partial"
+INSTALL_STARTED=0
+UPDATE_STARTED=0   # update sets it once its checks have passed and it begins to change files (see cmd_update)
+UPDATE_PARTIAL_OWNED=0   # 1 while manifest.partial is the file this update created and has not yet renamed
+AQUA_REACT_OFF=0   # 1 while an `aqua follow|ignore|auto` runs with aquaReact false in control.json (see cmd_aqua)
+RESTART_MARKED=0   # 1 from the moment every file is in place until the restart is confirmed, when the restart marker exists (see cmd_update)
+PLIST_REMOVED=0   # uninstall sets it once this run has removed the LaunchAgent plist (see cmd_uninstall)
+RESTART_WAIT_S="${CLAWD_RESTART_WAIT_S:-45}"   # how long a command waits for the agent it restarted (launchd may hold a respawn for 30 s); a test shortens it
+case "$RESTART_WAIT_S" in ''|*[!0-9]*) RESTART_WAIT_S=45 ;; esac
+# Test hooks: the CLI test points these at stubs inside a fake HOME. Production uses the defaults.
+LAUNCHCTL="${CLAWD_LAUNCHCTL:-/bin/launchctl}"
+AQUA_INFO_PLIST="${CLAWD_AQUA_INFO_PLIST:-/Applications/Aqua Voice.app/Contents/Info.plist}"
+OWN_PIDS_CHECKER=""  # uninstall picks it: CLAWD_OWN_PIDS_CHECKER, else the installed agent, else the repo build
+TESTED_AQUA="0.21.4"
+DOMAIN="gui/$(id -u)"
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+die() {
+  echo "clawd-pet: $*" >&2
+  if [ "$UPDATE_PARTIAL_OWNED" = 1 ]; then rm -f -- "$MANIFEST_PARTIAL"; UPDATE_PARTIAL_OWNED=0; fi
+  if [ "$INSTALL_STARTED" = 1 ]; then echo "clawd-pet: the install is incomplete; run scripts/uninstall from the repo to remove it" >&2; fi
+  if [ "$UPDATE_STARTED" = 1 ]; then echo "clawd-pet: the update stopped partway; the pet still works, and running update again finishes it (it is safe to repeat)" >&2; fi
+  if [ "$PLIST_REMOVED" = 1 ]; then echo "clawd-pet: this run already removed the LaunchAgent plist (launchd cannot load it again); run uninstall again to finish" >&2; fi
+  exit 2
+}
+
+usage() {
+  echo "clawd-pet: a small Clawd that lives on your screen and also reacts while you dictate with Aqua Voice (display only)."
+  echo "It has no Dock icon and never touches Aqua."
+  echo ""
+  echo "  help                 show this text"
+  echo "  status               service state, pid, last parsed event, Aqua version, focus-event count"
+  echo "  start                show Clawd near the bottom-left of the screen (loads the LaunchAgent if needed)"
+  echo "  stop                 remove Clawd from the screen (unloads the LaunchAgent)"
+  echo "  size N               N is 0.5, 0.75, 1, 1.5, 2, 3 or 4 (1 is 48 pt, the default)"
+  echo "  helmet on|off        optional space helmet (off by default)"
+  echo "  look random|ID       wear one look all the time (ID is a look of the installed art, e.g. sunglasses); random lets Clawd change its look again"
+  echo "  walk on|off          short walks along the bottom of the screen (on by default)"
+  echo "  motion LEVEL         how often Clawd does something on its own: off, quiet (default), normal or lively"
+  echo "  look-every 2h|3h|4h  how often Clawd changes its look (4h by default; the mean of the drawn interval: each gap is drawn between 0.75 and 1.25 times it)"
+  echo "  bubble on|off        the speech bubble while you dictate (on by default)"
+  echo "  bubble list          the 15 bubble styles and which are enabled"
+  echo "  bubble exclude N     never use bubble style N (1 to 15); 'bubble include N' brings it back"
+  echo "  bubble side SIDE     where the bubble sits: below (default), above, left or right of Clawd"
+  echo "  aqua follow|ignore|auto  whether Clawd stays hidden while Aqua Voice is not running: follow = yes, ignore = no, auto (default) = yes only"
+  echo "                       when Aqua Voice is installed; the agent restarts once to apply it"
+  echo "  aqua react on|off    whether Clawd reacts to dictation at all (on by default); off reads no Aqua log and shows Clawd whether or not"
+  echo "                       Aqua Voice runs; the agent restarts once to apply it"
+  echo "  full-screen on|off   whether Clawd shows over full-screen apps (off by default); the agent restarts once to apply it"
+  echo "  chat view chat|terminal|stream  what the chat panel shows: the chat page (chat, the default), Claude Code's own screen (terminal) or the older message list (stream)"
+  echo "  chat queue on|off  whether a message sent while Claude answers waits as a queued card (on, the default) or goes into the running turn at once"
+  echo "  chat folder PATH   the folder the chat starts Claude Code in (an absolute path to a folder that exists; your home folder by default)"
+  echo "  chat on|off        whether the chat can be opened (on by default)"
+  echo "  chat permissions deny|bypass  what the chat does when Claude Code needs approval: deny refuses (the default); bypass lets it act without asking (at your own risk)"
+  echo "  chat model NAME|default  the model the next chat session starts Claude Code with (default: Claude Code's own)"
+  echo "  chat claude PATH   where the chat finds claude (an absolute path, or one starting with ~/); without one it looks in ~/.local/bin, /opt/homebrew/bin and /usr/local/bin"
+  echo "  hide [MINUTES]       hide Clawd for MINUTES (default 60; 0 hides until 'show')"
+  echo "  show                 show Clawd again"
+  echo "                       Settings apply live. Exit 0: the running agent confirmed it (or it is not running and picks it up at its next"
+  echo "                       start); exit 3: saved, but the agent did not confirm within 2 s; exit 2: invalid input."
+  echo "  install              from the repo only: copy the files and write the LaunchAgent; starts nothing"
+  echo "  update               from the repo only, after a build: bring an installed pet up to this build in place (new agent, new art,"
+  echo "                       new CLI); the LaunchAgent plist and the launcher are never touched, so macOS shows no new background-item"
+  echo "                       notice; restarts the agent only when something it has already read changed (or an earlier update was cut"
+  echo "                       before its restart was confirmed); one update at a time"
+  echo "  uninstall            remove everything install created, also what an interrupted install left (the log agent.log is kept and its path printed)"
+}
+
+# launchd's answer for the label: `list` exits 0 while the job is loaded and 113 ("Could not find service") once it is not. Any other
+# exit is a failed look that proves neither, so only 113 counts as unloaded: stop and uninstall wait for it and otherwise fail closed
+# (Codex e40a50, 2026-10-21: a failed `list` read as "unloaded" let uninstall go on while the job could still start its agent).
+load_state() {
+  "$LAUNCHCTL" list "$LABEL" >/dev/null 2>&1
+  case $? in 0) echo loaded ;; 113) echo unloaded ;; *) echo unknown ;; esac
+}
+is_loaded() { [ "$(load_state)" != unloaded ]; }   # loaded, or not known to be unloaded
+# launchctl bootout returns before the job is gone (it completes asynchronously). Poll for up to 10 s: UNLOAD_WAIT_STEPS sleeps of 100 ms.
+wait_unloaded() {
+  local n=0
+  while is_loaded; do
+    [ "$n" -lt "$UNLOAD_WAIT_STEPS" ] || return 1
+    sleep 0.1
+    n=$((n + 1))
+  done
+  return 0
+}
+installed() { [ -f "$MANIFEST" ] && [ -f "$PLIST" ]; }
+service_pid() {
+  "$LAUNCHCTL" list "$LABEL" 2>/dev/null | sed -n 's/.*"PID" = \([0-9][0-9]*\);.*/\1/p' | head -n 1
+}
+json_value() { /usr/bin/plutil -extract "$1" raw -o - "$ROOT/status.json" 2>/dev/null; }
+# control_choice KEY DEFAULT WORD...: the string stored under KEY in control.json when it is exactly one of the WORDs, else DEFAULT, as the
+# agent reads it. plutil ends its output with one newline; a bare command substitution would also drop newlines that belong to the value.
+control_choice() {
+  local key="$1" default="$2" value word; shift 2
+  value="$(/usr/bin/plutil -extract "$key" raw -o - "$CONTROL" 2>/dev/null; printf x)"; value="${value%x}"; value="${value%$'\n'}"
+  for word in "$@"; do if [ "$value" = "$word" ]; then printf '%s\n' "$word"; return 0; fi; done
+  printf '%s\n' "$default"
+}
+
+cmd_status() {
+  if installed; then echo "installed: yes"; else echo "installed: no"; fi
+  case "$(load_state)" in
+    loaded)
+      echo "service: loaded"
+      pid="$(service_pid)"
+      echo "pid: ${pid:-none}" ;;
+    unloaded)
+      echo "service: not loaded"
+      echo "pid: none" ;;
+    *)
+      echo "service: unknown (launchctl list failed)"
+      echo "pid: unknown" ;;
+  esac
+  last="$(json_value lastEvent || true)"
+  if [ -n "$last" ]; then
+    then_epoch="$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$last" +%s 2>/dev/null || true)"
+    if [ -n "$then_epoch" ]; then
+      echo "last parsed event: $last ($(( $(date +%s) - then_epoch )) s ago)"
+    else
+      echo "last parsed event: $last"
+    fi
+  else
+    echo "last parsed event: none"
+  fi
+  focus="$(json_value focusViolations || true)"
+  echo "activation/key/main events since install: ${focus:-0}"
+  wake="$(json_value wakeCount || true)"
+  display="$(json_value displayChangeCount || true)"
+  if [ "${wake:-0}" -gt 0 ] 2>/dev/null; then echo "wake coverage: $wake observed"; else echo "wake coverage: not yet observed"; fi
+  if [ "${display:-0}" -gt 0 ] 2>/dev/null; then echo "display-change coverage: $display observed"; else echo "display-change coverage: not yet observed"; fi
+  if [ "$(json_value sourceBEnabled || true)" = "true" ]; then echo "release hint (source B): enabled"; else echo "release hint (source B): disabled"; fi
+  if [ -f "$ROOT/status.json" ]; then
+    # What the running agent says is in effect (v2 agents; an older agent's status.json lacks these, shown as none).
+    applied="$(json_value appliedGeneration || true)"
+    echo "applied generation: ${applied:-none}"
+    for key in look walk motion bubble; do value="$(json_value "$key" || true)"; echo "$key: ${value:-none}"; done
+    mode="$(json_value aquaMode || true)"
+    echo "aqua: ${mode:-unknown} (setting $(control_choice aqua auto follow ignore auto))"
+    quiet="$(json_value quiet || true)"
+    if [ -n "$quiet" ]; then echo "quiet: $quiet"; fi
+    due="$(json_value nextLookChange || true)"
+    if [ -n "$due" ]; then
+      # BSD date takes whole epoch seconds. Keep the conversion outside any shell program in a substitution (bash 3.2).
+      due_local="$(date -r "${due%%.*}" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || true)"
+      if [ -n "$due_local" ]; then echo "next look change due: $due_local"; fi
+    fi
+    restart="$(restart_pending 0)"
+    if [ -n "$restart" ]; then echo "restart required: $restart (generation $(json_value restartGeneration || true)); 'clawd-pet stop' and 'clawd-pet start' apply it"; fi
+  fi
+  if [ ! -e "$AQUA_INFO_PLIST" ]; then
+    echo "Aqua Voice: not installed"
+    return 0
+  fi
+  version="$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$AQUA_INFO_PLIST" 2>/dev/null || true)"
+  echo "Aqua version: ${version:-unknown}"
+  if [ "${version:-unknown}" != "$TESTED_AQUA" ]; then
+    echo "WARNING: Aqua version differs from the tested $TESTED_AQUA; Clawd may stay idle until its log keys are re-checked."
+  fi
+  return 0
+}
+
+cmd_start() {
+  if ! installed; then
+    if [ -e "$MANIFEST" ] || [ -e "$MARKER" ]; then die "an install or an uninstall is unfinished; run scripts/uninstall from the repo"; fi
+    die "not installed; run scripts/install from the repo"
+  fi
+  if ! is_loaded; then
+    "$LAUNCHCTL" bootstrap "$DOMAIN" "$PLIST" || die "launchctl bootstrap failed"
+  fi
+  "$LAUNCHCTL" kickstart "$DOMAIN/$LABEL" || die "launchctl kickstart failed"
+  echo "clawd-pet: started. 'clawd-pet stop' removes it from the screen."
+}
+
+cmd_stop() {
+  "$LAUNCHCTL" bootout "$DOMAIN/$LABEL" >/dev/null 2>&1
+  wait_unloaded || die "launchctl bootout failed; the service is still loaded after 10 s"
+  echo "clawd-pet: stopped."
+}
+
+# --- settings --------------------------------------------------------------------------------------------------------
+# One writer path for every setting. A write takes an exclusive flock(2) lock on $CONTROL_LOCK and holds it across the whole
+# read-modify-write: read control.json, change one key, bump `generation`, write $CONTROL_PARTIAL, rename it over control.json. So a
+# `walk off` never reverts a concurrent `size 2`. Readers (the agent) take no lock: a rename never shows a half-written file.
+# The lock file is created by install and never by a writer; a writer that finds it missing stops. Input is validated before the lock,
+# so invalid input leaves control.json byte-identical (exit 2). After the write the CLI waits up to 2 s for the running agent to
+# report the generation in status.json (`appliedGeneration`): exit 0 when it did, 3 when it did not, and exit 0 with "saved; applies at
+# the next start" when the agent is not running.
+
+now_ms() { /usr/bin/perl -MTime::HiRes=time -e 'printf("%d", time() * 1000)'; }
+
+# The one place a lock is taken: an exclusive flock(2) on the open descriptor $1, waiting up to $2 s (0: not at all). Status 0 locked, 75
+# the lock is held by someone else, anything else a failure. The lock lasts as long as the descriptor is open in any process, so it ends
+# with the process that holds it, however that process ends.
+lock_descriptor() { "$LOCKF" -s -t "$2" "$1"; }
+
+# Opens and locks $CONTROL_LOCK on descriptor 9 (never creating the file); `unlock_control` closes it. The descriptor is inherited by
+# every command run while the lock is held, so the lock lasts as long as the section does, however it ends.
+lock_control() {
+  [ -f "$CONTROL" ] || die "not installed; run scripts/install from the repo"
+  [ -f "$CONTROL_LOCK" ] && [ ! -L "$CONTROL_LOCK" ] || die "$CONTROL_LOCK is missing: this install has no settings lock; run scripts/uninstall and scripts/install from the repo"
+  if ! exec 9<"$CONTROL_LOCK"; then die "cannot read $CONTROL_LOCK"; fi
+  lock_descriptor 9 "$CONTROL_LOCK_WAIT_S"
+  case $? in
+    0) ;;
+    75) die "another settings change holds $CONTROL_LOCK for more than $CONTROL_LOCK_WAIT_S s; nothing was changed" ;;
+    *) die "could not lock $CONTROL_LOCK; nothing was changed" ;;
+  esac
+}
+unlock_control() { exec 9<&-; }
+
+# The style numbers in control.json key $1 when every element is an integer from $2 to $3, one per line; a missing or wrongly typed key,
+# or one bad element, reads as none, like the agent, and so does an old key (1-12) that holds all twelve. (Kept out of the caller's
+# command substitution: a case statement and this quoted perl program inside `$( )` broke bash's parse there.)
+excluded_key_styles() {
+  local raw
+  raw="$(/usr/bin/plutil -extract "$1" json -o - "$CONTROL" 2>/dev/null)" || return 0
+  printf '%s' "$raw" | /usr/bin/perl -e '
+    local $/; my $raw = <STDIN>;
+    exit unless $raw =~ /^\s*\[(.*)\]\s*$/s;
+    my $body = $1; exit if $body =~ /^\s*$/;
+    my @values = split /,/, $body, -1;
+    for my $n (@values) {
+      exit unless $n =~ /^\s*-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\s*$/;
+      exit unless $n >= $ARGV[0] && $n <= $ARGV[1] && $n == int($n);
+    }
+    my %styles = map { (0 + $_) => 1 } @values;
+    exit if $ARGV[0] == 1 && keys(%styles) >= 12;
+    print 0 + $_, "\n" for @values;
+  ' "$2" "$3"
+  return 0
+}
+
+# The numbers of the excluded bubble styles in control.json, one per line: styles 1-12 in bubbleExcluded (the key a previous build reads)
+# and 13-15 in bubbleExcludedNew. At least one of styles 1-12 stays enabled, like the agent.
+excluded_styles() {
+  { excluded_key_styles bubbleExcluded 1 12; excluded_key_styles bubbleExcludedNew 13 15; } | sort -n -u
+  return 0
+}
+
+# One edit of $CONTROL_PARTIAL. TYPE is a plutil type (bool, float, integer, string or json), or `remove`: the key goes out of the file
+# (VALUE is ignored; a key that is not there is already out).
+edit_partial() {
+  if [ "$2" = remove ]; then
+    /usr/bin/plutil -extract "$1" xml1 -o - "$CONTROL_PARTIAL" >/dev/null 2>&1 || return 0   # xml1 reads a value of any type (json refuses a string and a number)
+    /usr/bin/plutil -remove "$1" "$CONTROL_PARTIAL" 2>/dev/null
+  else
+    /usr/bin/plutil -replace "$1" "-$2" "$3" "$CONTROL_PARTIAL" 2>/dev/null
+  fi
+}
+
+# write_control KEY TYPE VALUE [KEY TYPE VALUE]...: runs with the lock held. Every triple is one edit of the one new file, and one
+# generation covers them all.
+write_control() {
+  local gen
+  gen="$(/usr/bin/plutil -extract generation raw -o - "$CONTROL" 2>/dev/null)" || gen=0
+  case "$gen" in ''|*[!0-9]*) gen=0 ;; esac
+  gen=$((gen + 1))
+  /usr/bin/plutil -convert json -o "$CONTROL_PARTIAL" "$CONTROL" 2>/dev/null || { rm -f -- "$CONTROL_PARTIAL"; die "control.json is damaged; nothing was changed"; }
+  while [ "$#" -ge 3 ]; do
+    edit_partial "$1" "$2" "$3" || { rm -f -- "$CONTROL_PARTIAL"; die "could not update control.json; nothing was changed"; }
+    shift 3
+  done
+  /usr/bin/plutil -replace generation -integer "$gen" "$CONTROL_PARTIAL" 2>/dev/null || { rm -f -- "$CONTROL_PARTIAL"; die "could not update control.json; nothing was changed"; }
+  mv -f "$CONTROL_PARTIAL" "$CONTROL" || { rm -f -- "$CONTROL_PARTIAL"; die "could not replace control.json"; }
+  NEW_GENERATION="$gen"
+}
+
+# True when status.json reports an appliedGeneration of at least $1. This is the one place the CLI reads that key: anything that is not a
+# whole number (a missing file or key, a string) is not a confirmation.
+applied_at_least() {
+  local applied
+  applied="$(json_value appliedGeneration || true)"
+  case "$applied" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$applied" -ge "$1" ]
+}
+
+# The restart-only keys the running agent reports for generation $1 or a later one (status.json: restartRequired, with the
+# restartGeneration that carries them), comma-separated; nothing when none are pending. The agent writes them instead of confirming the
+# generation: overFullScreen, releaseHintsEnabled, selectedInputKeyPath, idleBudgetMode, aqua and aquaReact are read once, when the agent starts.
+restart_pending() {
+  local at keys
+  at="$(json_value restartGeneration || true)"
+  case "$at" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$at" -ge "$1" ] || return 0
+  keys="$(/usr/bin/plutil -extract restartRequired json -o - "$ROOT/status.json" 2>/dev/null)" || return 0
+  keys="$(printf '%s' "$keys" | tr -d '[]" ')"
+  [ -z "$keys" ] || printf '%s' "$keys"
+  return 0
+}
+
+# A setting whose keys only a restart applies: restarts the agent once (launchctl kickstart -k, as v1 did for every setting) and waits for
+# the new process to confirm generation $1. Returns 0 (confirmed) or 3.
+restart_for_setting() {
+  local gen="$1" what="$2" keys="$3" old
+  old="$(service_pid)"
+  if ! "$LAUNCHCTL" kickstart -k "$DOMAIN/$LABEL" >/dev/null; then
+    echo "clawd-pet: $what: saved as generation $gen, but $keys only applies after a restart and launchctl kickstart -k failed; 'clawd-pet stop' and 'clawd-pet start' apply it" >&2
+    return 3
+  fi
+  if wait_restarted "$old" "$gen"; then
+    if [ "$AQUA_REACT_OFF" = 1 ]; then
+      # React is off, so the agent resolved the follow mode to ignore whatever was saved.
+      echo "clawd-pet: $what: saved; in effect: ignore (React is off)"
+    else
+      echo "clawd-pet: $what: applied (generation $gen) after restarting the agent, because $keys is read only when the agent starts"
+    fi
+    return 0
+  fi
+  echo "clawd-pet: $what: saved as generation $gen; the agent was restarted for $keys but did not confirm within $RESTART_WAIT_S s: $RESTART_WHY" >&2
+  return 3
+}
+
+# Waits for the running agent to report generation $1; prints the outcome. Returns 0 (applied, or not running) or 3 (not confirmed).
+await_applied() {
+  local gen="$1" what="$2" start pending
+  if [ -z "$(service_pid)" ]; then
+    echo "clawd-pet: $what: saved; applies at the next start (generation $gen)"
+    return 0
+  fi
+  start="$(now_ms)"
+  while :; do
+    if applied_at_least "$gen"; then echo "clawd-pet: $what: applied (generation $gen)"; return 0; fi
+    pending="$(restart_pending "$gen")"
+    if [ -n "$pending" ]; then restart_for_setting "$gen" "$what" "$pending"; return $?; fi
+    [ "$(( $(now_ms) - start ))" -lt "$APPLY_WAIT_MS" ] || break
+    sleep 0.05
+  done
+  echo "clawd-pet: $what: saved as generation $gen, but the running agent did not confirm it within 2 s" >&2
+  return 3
+}
+
+# change_setting WHAT KEY TYPE VALUE [KEY TYPE VALUE]...: every triple goes into the one write (one lock, one generation).
+change_setting() {
+  local what="$1"
+  shift
+  lock_control
+  write_control "$@"
+  unlock_control
+  await_applied "$NEW_GENERATION" "$what"
+}
+
+cmd_size() {
+  case "${1:-}" in
+    0.5|0.75|1|1.5|2|3|4) change_setting "size $1" scale float "$1" ;;
+    *) die "size must be 0.5, 0.75, 1, 1.5, 2, 3 or 4 (1 is the 48 pt default)" ;;
+  esac
+}
+
+# `helmet on|off` is the v1 alias of a look pin (spec 5.1): on pins the helmet, off goes back to plain and rotation resumes. The agent lets an
+# explicit `lookPin` win over the helmet key (SettingsWatcher.effectiveScheduler), so each of the two also takes the pin out in the same write;
+# otherwise `helmet on` after `look sunglasses` would apply and show nothing.
+cmd_helmet() {
+  case "${1:-}" in
+    on) change_setting "helmet on" helmet bool true lookPin remove "" ;;
+    off) change_setting "helmet off" helmet bool false lookPin remove "" ;;
+    *) die "helmet must be on or off" ;;
+  esac
+}
+
+# The ids of the looks of the installed art (the `looks` list of $ROOT/art/clawd-atlas.json), one per line. Fails when the atlas cannot be
+# read, or when an id is empty or holds a control character (a newline would turn one id into two lines of the list).
+installed_look_ids() {
+  local atlas="$ROOT/art/clawd-atlas.json" count i id
+  [ -f "$atlas" ] && [ ! -L "$atlas" ] || return 1
+  count="$(/usr/bin/plutil -extract looks raw -o - "$atlas" 2>/dev/null)" || return 1
+  case "$count" in ''|*[!0-9]*) return 1 ;; esac
+  i=0
+  while [ "$i" -lt "$count" ]; do
+    id="$(/usr/bin/plutil -extract "looks.$i.id" raw -o - "$atlas" 2>/dev/null)" || return 1
+    case "$id" in ''|*[[:cntrl:]]*) return 1 ;; esac
+    printf '%s\n' "$id"
+    i=$((i + 1))
+  done
+}
+
+# look_installed ID IDS: true when ID is, as a whole string, one line of IDS. (`grep -qxF` is not that: it treats every line of its pattern
+# as a pattern of its own, so an ID of two lines passes when either line is a real id.)
+look_installed() {
+  local line
+  while IFS= read -r line; do
+    [ "$line" = "$1" ] && return 0
+  done <<EOF
+$2
+EOF
+  return 1
+}
+
+# look random|ID: pins the look (`lookPin`) or takes the pin out so that Clawd rotates its looks again. The id is checked against the looks
+# of the installed art before the lock is taken. The v1 helmet key and the pin are kept consistent in the same write (spec 5.1: `helmet on|off`
+# stays an alias): `look helmet` also switches the helmet key on, so that a later `helmet off` is a real "back to plain" (the agent starts that
+# only from a helmet that was on), and `look random` also switches the helmet key off, because with it on the helmet would stay pinned and
+# rotation would never resume.
+cmd_look() {
+  local id="${1:-}" ids
+  [ -n "$id" ] || die "look takes random or the id of a look"
+  [ -f "$CONTROL" ] || die "not installed; run scripts/install from the repo"
+  if [ "$id" = random ]; then
+    change_setting "look random" lookPin remove "" helmet bool false
+    return $?
+  fi
+  ids="$(installed_look_ids)" || die "cannot read the looks of the installed art ($ROOT/art/clawd-atlas.json); nothing was changed"
+  look_installed "$id" "$ids" || die "look must be random or one of: $(printf '%s' "$ids" | tr '\n' ' ')"
+  if [ "$id" = helmet ]; then
+    change_setting "look helmet" lookPin string helmet helmet bool true
+  else
+    change_setting "look $id" lookPin string "$id"
+  fi
+}
+
+# control_bool KEY DEFAULT: true or false as the agent reads a Bool key of control.json (a string "false" or a number is not one: DEFAULT).
+control_bool() {
+  local type value
+  type="$(/usr/bin/plutil -type "$1" "$CONTROL" 2>/dev/null)" || type=""
+  value="$(/usr/bin/plutil -extract "$1" raw -o - "$CONTROL" 2>/dev/null)" || value=""
+  if [ "$type" = bool ] && { [ "$value" = true ] || [ "$value" = false ]; }; then printf '%s\n' "$value"; else printf '%s\n' "$2"; fi
+}
+
+# aqua follow|ignore|auto: the key is read once, when the agent starts, so the agent is restarted once (restart_for_setting) to apply it.
+# With aquaReact false the agent resolves the mode to ignore whatever is saved, and the restart's line says so.
+# aqua react on|off: aquaReact is read once too, so it restarts the agent once as well.
+cmd_aqua() {
+  case "${1:-}" in
+    follow|ignore|auto)
+      [ -z "${2:-}" ] || { usage >&2; exit 2; }
+      if [ "$(control_bool aquaReact true)" = false ]; then AQUA_REACT_OFF=1; fi
+      change_setting "aqua $1" aqua string "$1" ;;
+    react)
+      case "${2:-}" in
+        on) change_setting "aqua react on" aquaReact bool true ;;
+        off) change_setting "aqua react off" aquaReact bool false ;;
+        *) die "aqua react must be on or off" ;;
+      esac ;;
+    *) die "aqua takes follow, ignore or auto, or react on|off" ;;
+  esac
+}
+
+# full-screen on|off: overFullScreen is read once, when the agent starts, so the agent is restarted once (restart_for_setting) to apply it.
+cmd_full_screen() {
+  case "${1:-}" in
+    on) change_setting "full-screen on" overFullScreen bool true ;;
+    off) change_setting "full-screen off" overFullScreen bool false ;;
+    *) die "full-screen must be on or off" ;;
+  esac
+}
+
+cmd_walk() {
+  case "${1:-}" in
+    on) change_setting "walk on" walk bool true ;;
+    off) change_setting "walk off" walk bool false ;;
+    *) die "walk must be on or off" ;;
+  esac
+}
+
+cmd_motion() {
+  case "${1:-}" in
+    off|quiet|normal|lively) change_setting "motion $1" motion string "$1" ;;
+    *) die "motion must be off, quiet, normal or lively" ;;
+  esac
+}
+
+cmd_look_every() {
+  case "${1:-}" in
+    2h|3h|4h) change_setting "look-every $1" lookEveryHours integer "${1%h}" ;;
+    2|3|4) change_setting "look-every ${1}h" lookEveryHours integer "$1" ;;
+    *) die "look-every must be 2h, 3h or 4h" ;;
+  esac
+}
+
+# chat view chat|terminal|stream: which surface the chat panel shows (spec F5, r9).
+# chat queue on|off: whether a message sent while Claude answers waits as a queued card (on, the default) or goes into the running turn at once.
+cmd_chat() {
+  case "${1:-}" in
+    view)
+      case "${2:-}" in
+        chat|terminal|stream) change_setting "chat view $2" chatView string "$2" ;;
+        *) die "chat view must be chat, terminal or stream" ;;
+      esac ;;
+    queue)
+      case "${2:-}" in
+        on) change_setting "chat queue on" chatQueueFollowUps bool true ;;
+        off) change_setting "chat queue off" chatQueueFollowUps bool false ;;
+        *) die "chat queue must be on or off" ;;
+      esac ;;
+    folder)
+      # An absolute path of at most 1024 bytes to a folder that exists, as the agent reads it (ChatSettings.absolutePath). The text names no path.
+      case "${2:-}" in
+        /*) ;;
+        *) die "chat folder takes an absolute path to a folder that exists" ;;
+      esac
+      case "$2" in
+        *[[:cntrl:]]*) die "chat folder takes an absolute path to a folder that exists" ;;
+      esac
+      [ "${#2}" -le 1024 ] && [ -d "$2" ] || die "chat folder takes an absolute path to a folder that exists"
+      change_setting "chat folder" chatFolder string "$2" ;;
+    on) [ -z "${2:-}" ] || die "chat on takes no argument"; change_setting "chat on" chat bool true ;;
+    off) [ -z "${2:-}" ] || die "chat off takes no argument"; change_setting "chat off" chat bool false ;;
+    permissions)
+      case "${2:-}" in
+        deny|bypass) change_setting "chat permissions $2" chatPermissions string "$2" ;;
+        *) die "chat permissions must be deny or bypass" ;;
+      esac ;;
+    model)
+      # What the agent reads (ChatSettings.validModel): 1 to 64 ASCII letters, digits and . _ : [ ] -. `default` takes the key out. The text names no model.
+      case "${2:-}" in
+        default) change_setting "chat model default" chatModel remove "" ;;
+        *[[:cntrl:]]*) die "chat model takes a model name of 1 to 64 letters, digits and . _ : [ ] -, or default" ;;
+        *)
+          printf '%s\n' "${2:-}" | LC_ALL=C /usr/bin/grep -Eqx '[]A-Za-z0-9._:[-]{1,64}' || die "chat model takes a model name of 1 to 64 letters, digits and . _ : [ ] -, or default"
+          change_setting "chat model" chatModel string "$2" ;;
+      esac ;;
+    claude)
+      # What the agent reads (ChatSettings.absolutePath): not empty, at most 1024 bytes, absolute or starting with ~/ (or exactly ~). The text names no path.
+      case "${2:-}" in
+        /*|"~"|"~/"*) ;;
+        *) die "chat claude takes an absolute path to claude, or one starting with ~/" ;;
+      esac
+      [ "$(printf '%s' "$2" | /usr/bin/wc -c | tr -d ' ')" -le 1024 ] || die "chat claude takes an absolute path to claude, or one starting with ~/"
+      change_setting "chat claude" chatClaude string "$2" ;;
+    *) die "chat takes: view chat|terminal|stream, queue on|off, on|off, permissions deny|bypass, model NAME|default, folder PATH, or claude PATH" ;;
+  esac
+}
+
+cmd_hide() {
+  local minutes=60 deadline
+  [ $# -le 1 ] || die "hide takes at most one argument: the minutes"
+  [ $# -eq 0 ] || minutes="$1"
+  case "$minutes" in ''|*[!0-9]*) die "hide takes a whole number of minutes (0 hides until 'clawd-pet show')" ;; esac
+  # Compared as text first: a long string of digits must not overflow the shell's integer.
+  [ "${#minutes}" -le 5 ] && [ "$((10#$minutes))" -le 10080 ] || die "hide takes at most 10080 minutes (one week); 0 hides until 'clawd-pet show'"
+  minutes=$((10#$minutes))
+  if [ "$minutes" -eq 0 ]; then
+    change_setting "hide until show" hiddenUntil integer -1
+  else
+    deadline=$(( $(date +%s) + minutes * 60 ))
+    change_setting "hide for $minutes min" hiddenUntil integer "$deadline"
+  fi
+}
+
+cmd_show() {
+  [ $# -eq 0 ] || die "show takes no argument"
+  change_setting "show" hiddenUntil integer 0
+}
+
+cmd_bubble() {
+  local n="${2:-}" styles joined newer s listed side
+  case "${1:-}" in
+    on|off|list) [ -z "$n" ] || die "bubble $1 takes no argument" ;;
+  esac
+  case "${1:-}" in
+    on) change_setting "bubble on" bubble bool true ;;
+    off) change_setting "bubble off" bubble bool false ;;
+    list)
+      lock_control
+      styles="$(excluded_styles)"
+      s=1
+      while [ "$s" -le 15 ]; do
+        if printf '%s\n' "$styles" | grep -qx "$s"; then echo "bubble style $s: excluded"; else echo "bubble style $s: enabled"; fi
+        s=$((s + 1))
+      done
+      if [ "$(/usr/bin/plutil -extract bubble raw -o - "$CONTROL" 2>/dev/null || true)" = "false" ]; then echo "bubble: off"; else echo "bubble: on"; fi
+      echo "bubble side: $(control_choice bubbleSide below below above left right)"
+      unlock_control ;;
+    side)
+      case "$n" in
+        below|above|left|right) change_setting "bubble side $n" bubbleSide string "$n" ;;
+        *) die "bubble side takes below, above, left or right" ;;
+      esac ;;
+    exclude|include)
+      case "$n" in [1-9]|1[0-5]) ;; *) die "bubble $1 takes a style number from 1 to 15" ;; esac
+      lock_control
+      styles="$(excluded_styles)"
+      if [ "$1" = exclude ]; then
+        listed="$(printf '%s\n%s\n' "$styles" "$n" | grep -E '^[0-9]+$' | sort -n -u)"
+        if [ "$n" -le 12 ] && [ "$(printf '%s\n' "$listed" | grep -Ec '^([1-9]|1[0-2])$')" -ge 12 ]; then die "cannot exclude every one of styles 1-12; style $n stays enabled (an older build needs one)"; fi
+      else
+        listed="$(printf '%s\n' "$styles" | grep -vx "$n" | grep -E '^[0-9]+$' || true)"
+      fi
+      # A rollback keeps every old exclusion: both builds leave at least one of styles 1-12 enabled.
+      joined="$(printf '%s\n' "$listed" | grep -E '^([1-9]|1[0-2])$' | paste -sd, - || true)"
+      newer="$(printf '%s\n' "$listed" | grep -E '^1[3-5]$' | paste -sd, - || true)"
+      write_control bubbleExcluded json "[$joined]" bubbleExcludedNew json "[$newer]"
+      unlock_control
+      await_applied "$NEW_GENERATION" "bubble $1 $n" ;;
+    *) die "bubble takes on, off, list, side SIDE, exclude N or include N" ;;
+  esac
+}
+
+# --- install ---------------------------------------------------------------------------------------------------
+# An install is ordered so that a kill at any point leaves a state `uninstall` removes completely or refuses by name:
+#   1. the marker $MARKER (outside $ROOT, written through a .partial and renamed) records whether this install creates $ROOT;
+#   2. $ROOT is created only if it is absent;
+#   3. the whole manifest is written to $ROOT/manifest.partial and renamed, so the manifest is absent or complete;
+#   4. only then the directories under $ROOT, the copies (the agent and the CLI through <target>.partial), control.json, the plist.
+# The marker stays for the life of the install. Shared parents ($HOME/bin, LaunchAgents, Application Support) must already
+# exist: install creates nothing outside $ROOT.
+
+on_install_signal() { # exit status
+  echo "clawd-pet: interrupted; run scripts/uninstall from the repo" >&2
+  exit "$1"
+}
+
+# Names of the entries directly inside $ROOT (hidden ones included), one per line.
+root_entries() {
+  local e
+  [ -d "$ROOT" ] || return 0
+  for e in "$ROOT"/* "$ROOT"/.[!.]* "$ROOT"/..?*; do
+    if [ -e "$e" ] || [ -L "$e" ]; then printf '%s\n' "${e#"$ROOT"/}"; fi
+  done
+}
+
+# One manifest line that records what log $1 held when this install began (nothing else is running then: no plist exists yet):
+#   logbase <path> absent            or            logbase <path> <bytes> <sha256 of those bytes>
+# scripts/attended-check.sh proves from these lines that the log it reads is the same generation (by content, not by size) and
+# counts FOCUS_VIOLATION lines only from the recorded offset. uninstall accepts and ignores them.
+logbase_line() {
+  local path="$1" bytes again hash
+  if [ ! -e "$path" ] && [ ! -L "$path" ]; then printf 'logbase %s absent\n' "$path"; return 0; fi
+  [ -f "$path" ] && [ ! -L "$path" ] || return 1
+  bytes="$(/usr/bin/stat -f %z "$path")" || return 1
+  hash="$(/usr/bin/shasum -a 256 < "$path")" || return 1
+  hash="${hash%% *}"
+  again="$(/usr/bin/stat -f %z "$path")" || return 1
+  [ "$bytes" = "$again" ] || return 1
+  case "$bytes" in ''|*[!0-9]*) return 1 ;; esac
+  case "$hash" in *[!0-9a-f]*|'') return 1 ;; esac
+  [ "${#hash}" -eq 64 ] || return 1
+  printf 'logbase %s %s %s\n' "$path" "$bytes" "$hash"
+}
+
+# Creates the ledger: the one header line `LEDGER 1 born=<epoch seconds> how=$1` ($1 is install, adopt-update or recreate), written to
+# $LEDGER_PARTIAL (mode 0600, never over an existing file), flushed and renamed by publish_file. The partial is this CLI's own: a leftover
+# one (the manifest lists it) is a cut run's and is replaced.
+create_ledger() {
+  local how="$1" born
+  born="$(/bin/date +%s)" || die "cannot read the clock for the focus-violation ledger"
+  case "$born" in ''|*[!0-9]*) die "cannot read the clock for the focus-violation ledger" ;; esac
+  if [ -e "$LEDGER_PARTIAL" ] || [ -L "$LEDGER_PARTIAL" ]; then rm -f -- "$LEDGER_PARTIAL" || die "cannot remove the leftover $LEDGER_PARTIAL"; fi
+  ( umask 077; set -C; printf 'LEDGER 1 born=%s how=%s\n' "$born" "$how" > "$LEDGER_PARTIAL" ) || die "cannot write $LEDGER_PARTIAL"
+  publish_file "$LEDGER_PARTIAL" "$LEDGER" "cannot publish the focus-violation ledger"
+}
+
+# The sha256 of file $1 as 64 lowercase hex digits; fails when it cannot be read.
+sha256_of() {
+  local h
+  h="$(/usr/bin/shasum -a 256 < "$1")" || return 1
+  h="${h%% *}"
+  case "$h" in *[!0-9a-f]*|'') return 1 ;; esac
+  [ "${#h}" -eq 64 ] || return 1
+  printf '%s' "$h"
+}
+
+# The sha256 recorded in $1, which holds exactly one line: "<64 hex digits>  clawd-pet-launch". Fails on anything else.
+recorded_launcher_sha() {
+  local h name
+  [ -f "$1" ] && [ ! -L "$1" ] || return 1
+  [ "$(grep -c '' "$1")" -eq 1 ] || return 1
+  read -r h name < "$1" || return 1
+  [ "$name" = clawd-pet-launch ] || return 1
+  case "$h" in *[!0-9a-f]*|'') return 1 ;; esac
+  [ "${#h}" -eq 64 ] || return 1
+  printf '%s' "$h"
+}
+
+# Durable publication. A rename is atomic, but the data of the file it renames may still be in the disk's cache: a kernel panic or a dead
+# battery in the next seconds can leave the new name on an empty or short file, and update and uninstall then refuse a truncated manifest.
+# So every file is flushed before its rename and the directory after it. macOS needs fcntl(F_FULLFSYNC), which is 51 in <sys/fcntl.h>: fsync(2)
+# and sync(1) leave the data in the drive's own cache. bash cannot call fcntl, so the one-line perl below does, the perl now_ms already uses.
+# It opens each path read-only without following a symlink or blocking on a FIFO, accepts only a regular file or a directory, and changes
+# nothing. Status 0 when every path is on the disk. CLAWD_FLUSH_PERL: a test seam (the interpreter), as CLAWD_LAUNCHCTL is.
+FLUSH_PERL="${CLAWD_FLUSH_PERL:-/usr/bin/perl}"
+flush_durable() {
+  "$FLUSH_PERL" -e 'use strict; use warnings; use Fcntl; my $bad = 0;
+    for my $p (@ARGV) {
+      my $fh;
+      if (!sysopen($fh, $p, O_RDONLY | O_NONBLOCK | O_NOFOLLOW)) { print STDERR "flush: cannot read $p: $!\n"; $bad = 1; next }
+      if (!(-f $fh || -d $fh)) { print STDERR "flush: not a regular file or a directory: $p\n"; $bad = 1; close $fh; next }
+      if (!defined fcntl($fh, 51, 0)) { print STDERR "flush: F_FULLFSYNC failed on $p: $!\n"; $bad = 1 }
+      close $fh;
+    }
+    exit $bad;' -- "$@"
+}
+
+# The rename that makes $1 (a .partial file) the file $2, made durable: $1 is flushed before the rename, so that $2, wherever it exists after
+# a crash, holds all of $1; the directory is flushed after it, so that the rename itself is on the disk. $3 is the clause a failed rename dies with.
+publish_file() {
+  flush_durable "$1" || die "could not flush $1 to the disk; it was not moved into place"
+  mv "$1" "$2" || die "$3"
+  flush_durable "${2%/*}" || die "could not flush ${2%/*} to the disk after moving $2 into place"
+}
+
+# Copy $1 to $2 through $2.partial: a published $2 is always a complete, executable copy. With a third argument (a sha256) the
+# partial must hash to it before it is published.
+copy_executable() {
+  cp "$1" "$2.partial" || die "copy failed: $2"
+  chmod 755 "$2.partial" || die "chmod failed: $2.partial"
+  if [ -n "${3:-}" ] && [ "$(sha256_of "$2.partial")" != "$3" ]; then die "the copy $2.partial does not match the recorded sha256 of its source"; fi
+  publish_file "$2.partial" "$2" "could not move $2 into place"
+}
+
+# The files a catalog names: every quoted "....png" string of the atlas at $1 (the pose frames, every motion frame, every look layer),
+# one raw path per line, sorted, without duplicates. Nothing is validated here; art_path_ok judges each path.
+atlas_assets() {
+  /usr/bin/grep -oE '"[^"]*\.png"' "$1" 2>/dev/null | /usr/bin/sed -e 's/^"//' -e 's/"$//' | LC_ALL=C /usr/bin/sort -u
+  return 0
+}
+
+# A path of the art tree has to be plain (letters, digits, . _ + - and /), relative, inside art/ and below at least one directory: the
+# agent reads it from the install by that very name, and the installer writes it there.
+art_path_ok() {
+  case "$1" in
+    ''|/*|*..*|./*|*/./*|*//*|*/) return 1 ;;
+    */*) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in *[!A-Za-z0-9._/+-]*) return 1 ;; esac
+  return 0
+}
+
+# Sets art_rel to every file an install of repo $1 puts under art/: the pose frames and each file the atlas names, sorted, without
+# duplicates, each one a plain path that exists in the source as a regular file. $2 is the clause a refusal ends with.
+collect_art_files() {
+  local repo="$1" tail="$2" rel list
+  art_rel=()
+  list="$( (cd "$repo/art" && ls frames/*.png; atlas_assets "$repo/art/clawd-atlas.json") | LC_ALL=C /usr/bin/sort -u)" || die "cannot list the art files"
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    art_path_ok "$rel" || die "art contract incomplete: the atlas or the frames directory names an unusable path: $rel ($tail)"
+    [ -f "$repo/art/$rel" ] && [ ! -L "$repo/art/$rel" ] || die "art contract incomplete: the atlas names art/$rel, which is missing from the source ($tail)"
+    art_rel+=("$rel")
+  done <<< "$list"
+}
+
+# The files of the chat page (Stage 2): the web view of the chat loads index.html from $ROOT/chat-page/ and may read that directory only.
+# The list is explicit; Tests/ClawdCoreTests/ChatWebPageFilesTests.swift keeps it equal to ChatWebPage.files and to the repo's chat-page/.
+CHAT_PAGE_FILES=(index.html page.css page.js marked.min.js Geist-Variable.woff2 OFL.txt LICENSE-marked.txt LICENSE-lucide.txt)
+
+# Sets page_rel to the files an install of repo $1 puts under chat-page/: all of CHAT_PAGE_FILES when the source has a chat-page/ directory,
+# none when it has no such directory (a source that predates the page installs without one, as probe/probe-release.json is optional). A
+# directory that lacks one of the files, or holds one as a symlink or a non-file, is refused. $2 is the clause a refusal ends with.
+collect_page_files() {
+  local repo="$1" tail="$2" rel
+  page_rel=()
+  [ -e "$repo/chat-page" ] || [ -L "$repo/chat-page" ] || return 0
+  [ -d "$repo/chat-page" ] && [ ! -L "$repo/chat-page" ] || die "chat page incomplete: chat-page is not a directory ($tail)"
+  for rel in "${CHAT_PAGE_FILES[@]}"; do
+    [ -f "$repo/chat-page/$rel" ] && [ ! -L "$repo/chat-page/$rel" ] || die "chat page incomplete: chat-page/$rel is missing from the source ($tail)"
+    page_rel+=("$rel")
+  done
+}
+
+# Sets launcher_src and launcher_sha: the checked-in launcher of repo $1 and the sha256 recorded for it, proven equal. $2 is the clause
+# the mismatch refusal ends with. Nothing builds the launcher: a different launcher is a different background item.
+verify_repo_launcher() {
+  local repo="$1" tail="$2"
+  launcher_src="$repo/launcher/clawd-pet-launch"
+  launcher_sha="$(recorded_launcher_sha "$repo/launcher/clawd-pet-launch.sha256")" || die "launcher/clawd-pet-launch.sha256 is missing or malformed (one line: <64 hex digits>  clawd-pet-launch); install never builds the launcher"
+  [ -f "$launcher_src" ] && [ ! -L "$launcher_src" ] || die "launcher/clawd-pet-launch is missing; it is checked in and install never builds it"
+  [ "$(sha256_of "$launcher_src")" = "$launcher_sha" ] || die "launcher/clawd-pet-launch does not match launcher/clawd-pet-launch.sha256; $tail"
+}
+
+cmd_install() {
+  trap 'on_install_signal 130' INT
+  trap 'on_install_signal 143' TERM
+  trap 'on_install_signal 129' HUP
+  repo="$(cd "$SELF_DIR/.." && pwd)"
+  [ -f "$repo/Package.swift" ] || die "install runs from the repo (scripts/install); this copy has no sources"
+  build="${CLAWD_BUILD_DIR:-$repo/.build/release}"
+  binary="$build/clawd-pet-agent"
+  [ -x "$binary" ] || die "build first: swift build -c release (missing $binary)"
+  template="$repo/launchd/$LABEL.plist.in"
+  [ -f "$template" ] || die "missing LaunchAgent template"
+  [ -f "$repo/art/clawd-atlas.json" ] && [ -f "$repo/art/claude-code-elements.json" ] || die "art contract incomplete (atlas or elements missing)"
+  ls "$repo"/art/frames/*.png >/dev/null 2>&1 || die "art contract incomplete (no frames)"
+  # Everything the atlas names has to be in the source: the agent draws each motion and look from the installed tree, and a catalog
+  # that names a file the install lacks makes it lose the picture (RENDER failed) mid-dictation.
+  collect_art_files "$repo" "nothing was installed"
+  collect_page_files "$repo" "nothing was installed"
+  # The launcher is a frozen, checked-in binary (launcher/launcher.c, built once by scripts/build-launcher). Install copies it and
+  # proves by sha256 that it is the recorded one; it never builds it, because a different launcher is a different background item.
+  verify_repo_launcher "$repo" "nothing was installed"
+
+  # Shared parents must already exist; install never creates a directory outside $ROOT.
+  for d in "$HOME/bin" "$HOME/Library" "$HOME/Library/LaunchAgents" "$HOME/Library/Application Support"; do
+    [ -d "$d" ] || die "create $d first (install never creates a directory outside $ROOT)"
+    [ ! -L "$d" ] || die "refusing a symlinked directory: $d"
+  done
+
+  files=("$AGENT" "$CLI_PATH" "$LAUNCHER" "$ROOT/art/clawd-atlas.json" "$ROOT/art/claude-code-elements.json")
+  sources=("$binary" "$repo/bin/clawd-pet" "$launcher_src" "$repo/art/clawd-atlas.json" "$repo/art/claude-code-elements.json")
+  partials=("$AGENT.partial" "$CLI_PATH.partial" "$LAUNCHER.partial" "$LEDGER_PARTIAL")
+  reserved=("$CONTROL" "$CONTROL_LOCK" "$CONTROL_PARTIAL" "$MANIFEST" "$PLIST" "$ROOT/state.json" "$ROOT/status.json" "$ROOT/lock" "$RESTART_MARKER" "$LEDGER")
+  # art/ and every directory the files below it need, parents before children (a sorted list puts a prefix first).
+  art_dirs=()
+  while IFS= read -r d; do art_dirs+=("$ROOT/$d"); done < <(
+    for rel in "${art_rel[@]}"; do
+      d="art/${rel%/*}"
+      while [ "$d" != art ]; do printf '%s\n' "$d"; d="${d%/*}"; done
+    done | LC_ALL=C /usr/bin/sort -u)
+  subdirs=("$ROOT/bin" "$ROOT/art" "${art_dirs[@]}" "$ROOT/probe")
+  if [ -f "$repo/probe/probe-release.json" ]; then
+    files+=("$ROOT/probe/probe-release.json"); sources+=("$repo/probe/probe-release.json")
+  else
+    reserved+=("$ROOT/probe/probe-release.json")
+  fi
+  # The chat page's files, one cp each from $repo/chat-page/ (they have an entry in $sources, so they come before the art files).
+  if [ "${#page_rel[@]}" -gt 0 ]; then
+    subdirs+=("$ROOT/chat-page")
+    for rel in "${page_rel[@]}"; do files+=("$ROOT/chat-page/$rel"); sources+=("$repo/chat-page/$rel"); done
+  fi
+  # The art files come last: they have no entry in $sources (each one is copied from $repo/art/ by its own relative name).
+  for rel in "${art_rel[@]}"; do files+=("$ROOT/art/$rel"); done
+
+  # Refuse anything an earlier install or a foreign file already holds.
+  for target in "$MARKER" "$MARKER_PARTIAL" "$MANIFEST" "$MANIFEST_PARTIAL" "$PLIST" "$CLI_PATH" "$CLI_PATH.partial"; do
+    [ ! -e "$target" ] && [ ! -L "$target" ] || die "refusing to overwrite $target (uninstall first)"
+  done
+  root_created=yes
+  if [ -L "$ROOT" ]; then
+    die "refusing a symlinked directory: $ROOT"
+  elif [ -e "$ROOT" ]; then
+    [ -d "$ROOT" ] || die "refusing: $ROOT exists and is not a directory"
+    root_created=no
+    while IFS= read -r entry; do
+      case "$entry" in
+        agent.log|agent.log.1) [ -f "$ROOT/$entry" ] && [ ! -L "$ROOT/$entry" ] || die "refusing: $ROOT/$entry is not a regular file (uninstall first)" ;;
+        *) die "refusing: $ROOT already holds $entry; only retained logs may be there (uninstall first)" ;;
+      esac
+    done < <(root_entries)
+  fi
+
+  # What the retained logs hold now, read before anything is created (a failure here refuses the install cleanly).
+  logbase_agent="$(logbase_line "$ROOT/agent.log")" || die "cannot read $ROOT/agent.log to record its state"
+  logbase_older="$(logbase_line "$ROOT/agent.log.1")" || die "cannot read $ROOT/agent.log.1 to record its state"
+
+  INSTALL_STARTED=1
+  printf 'root-created %s\n' "$root_created" > "$MARKER_PARTIAL" || die "cannot write the install marker"
+  publish_file "$MARKER_PARTIAL" "$MARKER" "cannot publish the install marker"
+  dirs=()
+  if [ "$root_created" = yes ]; then
+    dirs+=("$ROOT")
+    mkdir "$ROOT" || die "cannot create $ROOT"
+  fi
+  dirs+=("${subdirs[@]}")
+
+  {
+    echo "schema 1"
+    for f in "${files[@]}" "${reserved[@]}" "${partials[@]}" "$MARKER"; do echo "file $f"; done
+    for d in "${dirs[@]}"; do echo "dir $d"; done
+    echo "log $ROOT/agent.log"
+    echo "log $ROOT/agent.log.1"
+    printf '%s\n' "$logbase_agent" "$logbase_older"
+    echo "end"
+  } > "$MANIFEST_PARTIAL" || die "cannot write the manifest"
+  publish_file "$MANIFEST_PARTIAL" "$MANIFEST" "cannot publish the manifest"
+  # The ledger exists only once the manifest names it (an interrupted install with a marker and no manifest can never hold one) and before
+  # the plist: no agent can start without it.
+  create_ledger install
+
+  for d in "${subdirs[@]}"; do mkdir "$d" || die "cannot create $d"; done
+  i=0
+  while [ "$i" -lt "${#sources[@]}" ]; do
+    case "${files[$i]}" in
+      "$LAUNCHER") copy_executable "${sources[$i]}" "${files[$i]}" "$launcher_sha" ;;
+      "$AGENT"|"$CLI_PATH") copy_executable "${sources[$i]}" "${files[$i]}" ;;
+      *) cp "${sources[$i]}" "${files[$i]}" || die "copy failed: ${files[$i]}" ;;
+    esac
+    i=$((i + 1))
+  done
+  # The art files, each one a single file at its own name, a directory at a time (one cp per directory, not one per file).
+  batch=(); batch_dir=""
+  for rel in "${art_rel[@]}"; do
+    d="${rel%/*}"
+    if [ "$d" != "$batch_dir" ] || [ "${#batch[@]}" -ge 100 ]; then
+      if [ "${#batch[@]}" -gt 0 ]; then cp -- "${batch[@]}" "$ROOT/art/$batch_dir/" || die "copy failed: $ROOT/art/$batch_dir"; fi
+      batch=(); batch_dir="$d"
+    fi
+    batch+=("$repo/art/$rel")
+  done
+  if [ "${#batch[@]}" -gt 0 ]; then cp -- "${batch[@]}" "$ROOT/art/$batch_dir/" || die "copy failed: $ROOT/art/$batch_dir"; fi
+  # The settings lock exists from the install on; no writer ever creates, replaces or removes it.
+  : > "$CONTROL_LOCK" || die "cannot create $CONTROL_LOCK"
+  printf '%s\n' '{"scale":1,"helmet":false,"overFullScreen":false,"releaseHintsEnabled":false,"selectedInputKeyPath":"nativeMicrophone.id","idleBudgetMode":false,"generation":0}' > "$CONTROL" || die "cannot write control.json"
+  sed "s|@INSTALL_ROOT@|$ROOT|g" "$template" > "$PLIST" || die "cannot write the LaunchAgent plist"
+  /usr/bin/plutil -lint "$PLIST" >/dev/null || die "the LaunchAgent plist did not lint"
+  echo "clawd-pet: installed, nothing started. 'clawd-pet start' shows a small Clawd near the bottom-left;"
+  echo "it never takes focus; 'clawd-pet stop' removes it from the screen."
+}
+
+# --- update ----------------------------------------------------------------------------------------------------
+# update brings an installed pet to the repo's current build in place, so macOS keeps the one background item it already tracks.
+#   never touched   the LaunchAgent plist, the launcher (the program the plist names, which macOS tracks), control.json, control.lock,
+#                   state.json, status.json and the logs
+#   brought up      the agent, the CLI and the art: files the atlas names that are missing are added, files that differ are replaced
+# It refuses (exit 2, nothing changed) unless the install is complete, its plist names the installed launcher, that launcher has exactly
+# the sha256 recorded in the repo, and the source passes the checks install makes. Every new file and directory goes into the manifest
+# first (the union, written through manifest.partial and renamed), so uninstall removes all of it. Then: new directories; the pictures, new
+# and replaced alike, as one set (each through a .partial name: a file at its final name was flushed before it got there); every directory
+# of the art tree flushed once; the two JSON files (so a catalog never names a picture that is not on the disk, directory entry included);
+# the agent, the CLI, a check of every result, and only then one `launchctl kickstart -k`, and only when the running agent has already read
+# something that changed (the agent, a catalog, a replaced picture; a picture that was missing needs no restart). A cut at any point leaves
+# a working pet, and running update again finishes the job, the restart included: an update that must restart the agent creates
+# $RESTART_MARKER before it copies its first file and removes it only once the restart is confirmed (or the agent is not running), so a
+# re-run restarts the agent even when every file is already current (`update --restart` also restarts an agent when nothing is pending).
+# One update runs at a time: it takes an exclusive lock on the install directory for the whole run (take_update_lock), and a second one
+# stops at once. Holding the lock, an update knows that a manifest.partial beside the manifest is a cut update's leftover (when it is
+# provably one: manifest_partial_is_stale) and discards it.
+
+on_update_signal() { # exit status
+  if [ "$UPDATE_PARTIAL_OWNED" = 1 ]; then rm -f -- "$MANIFEST_PARTIAL"; UPDATE_PARTIAL_OWNED=0; fi
+  if [ "$UPDATE_STARTED" = 1 ]; then
+    echo "clawd-pet: update interrupted; the pet still works, and running update again finishes it (it is safe to repeat)" >&2
+  elif [ "$RESTART_MARKED" = 1 ]; then
+    echo "clawd-pet: update interrupted; every file was already in place, but the agent is not confirmed on the new build; running update again restarts it ('clawd-pet update --restart' does too)" >&2
+  else
+    echo "clawd-pet: update interrupted; nothing was changed, or every file was already in place; 'clawd-pet update --restart' restarts the agent onto the new build" >&2
+  fi
+  exit "$1"
+}
+
+# Prints "<sha256>  <path>" for every path read from stdin (relative to directory $1), 200 at a time; fails when a file cannot be read.
+sums_in() {
+  ( cd "$1" && /usr/bin/xargs -n 200 /usr/bin/shasum -a 256 -- )
+}
+
+# Reads "S <sha256>  <path>" lines (what is wanted, in the order to act) then "D <sha256>  <path>" lines (what is installed) and prints
+# "new <path>" for a wanted path that is not installed and "diff <path>" for one whose content differs.
+art_plan() {
+  /usr/bin/awk '
+    $1 == "S" { want[$3] = $2; order[++n] = $3; next }
+    $1 == "D" { have[$3] = $2 }
+    END { for (i = 1; i <= n; i++) { r = order[i]; if (!(r in have)) print "new " r; else if (have[r] != want[r]) print "diff " r } }'
+}
+
+# The manifest lines an update wants: every art file and directory, the .partial name of the agent, the CLI and each file update puts in
+# place, new or replaced (every one goes through a .partial name, so a cut leaves nothing the manifest does not name). Reads art_rel,
+# art_dirs, new_rel, diff_rel, page_rel, page_new and page_diff; the caller keeps the ones the manifest already holds out.
+update_manifest_lines() {
+  local rel d
+  for rel in "${art_rel[@]}"; do printf 'file %s/art/%s\n' "$ROOT" "$rel"; done
+  printf 'file %s/art/clawd-atlas.json\nfile %s/art/claude-code-elements.json\n' "$ROOT" "$ROOT"
+  for rel in ${page_rel[@]+"${page_rel[@]}"}; do printf 'file %s/chat-page/%s\n' "$ROOT" "$rel"; done
+  for rel in ${page_diff[@]+"${page_diff[@]}"} ${page_new[@]+"${page_new[@]}"}; do printf 'file %s/chat-page/%s.partial\n' "$ROOT" "$rel"; done
+  [ "${#page_rel[@]}" -eq 0 ] || printf 'dir %s/chat-page\n' "$ROOT"
+  printf 'file %s\n' "$AGENT.partial" "$CLI_PATH.partial"
+  for rel in ${diff_rel[@]+"${diff_rel[@]}"} ${new_rel[@]+"${new_rel[@]}"}; do printf 'file %s/art/%s.partial\n' "$ROOT" "$rel"; done
+  for d in ${art_dirs[@]+"${art_dirs[@]}"}; do printf 'dir %s\n' "$d"; done
+  printf 'file %s\n' "$RESTART_MARKER"
+  printf 'file %s\nfile %s\n' "$LEDGER" "$LEDGER_PARTIAL"
+}
+
+# One update at a time, for the whole run (the copies, the manifest, the restart and its confirmation): an exclusive flock(2) on the install
+# directory, held on descriptor 8 until this process ends. The kernel drops it when the holder dies, however it dies, so it needs no file
+# (nothing for uninstall to remove) and no cleanup; it is not the settings lock on control.lock (descriptor 9), and update takes no other lock,
+# so the two cannot wait for each other. A second update stops at once and says so; it never waits and changes nothing. Every run shares the
+# same .partial names, so two runs at once could truncate a file the other had just proved. uninstall takes the same lock for its whole run
+# (see cmd_uninstall): no update can be writing while it judges a manifest.partial or removes files.
+take_update_lock() {
+  local what="${1:-update}" untouched="nothing was changed" wait_s=0
+  # An update never waits. An uninstall waits a moment: the last children of an update that was just killed can still hold the lock.
+  [ "$what" != uninstall ] || { untouched="nothing was removed"; wait_s=3; }
+  if ! exec 8<"$ROOT"; then die "cannot read $ROOT to lock it; $untouched"; fi
+  lock_descriptor 8 "$wait_s"
+  case $? in
+    0) ;;
+    75) die "another update is already running (it holds the lock on $ROOT); $untouched; run $what again when it has finished" ;;
+    *) die "could not lock $ROOT; $untouched" ;;
+  esac
+}
+
+# True when file $1 is provably the leftover of an update that was cut before it published its manifest: a regular file whose lines are
+# the live manifest $2 in its own order, with only file and directory lines inside the install added, in the one place update puts them
+# (just before the first log line), and nothing more. That is what such an update writes (all of it, or less when the cut came while it
+# wrote), so an empty file passes and a foreign file, a symlink or the manifest of another install does not. Callers hold the update
+# lock, so no other update is writing it.
+manifest_partial_is_stale() {
+  [ -f "$1" ] && [ ! -L "$1" ] || return 1
+  /usr/bin/awk -v root="$ROOT" '
+    NR == FNR { live[++n] = $0; known[$0] = 1; if (!p && $0 ~ /^log /) p = n; next }
+    {
+      if ($0 in known) { if (k < n && $0 == live[k + 1]) { k++; next } bad = 1; exit }
+      if (p == 0 || k != p - 1 || $0 !~ /^(file|dir) /) { bad = 1; exit }
+      path = substr($0, index($0, " ") + 1)
+      if (index(path, root "/") != 1 || index(path, "/../") || index(path, "/./") || path ~ /\/\.\.$/) { bad = 1; exit }
+    }
+    END { exit bad }' "$2" "$1"
+}
+
+# Puts the art files $2... (names relative to art/, new or replaced alike) in place from repo $1, as a set: the guarantee of publish_file for
+# every file (flushed before its rename, its directory flushed after it, so a file at its final name was on the disk before it got there)
+# at two perl starts per set instead of two per file, because a fresh perl start costs about as much as the flush it makes. For a set (at
+# most FLUSH_CHUNK files, so the argument list stays short; a larger one is several sets, one after the other): every copy is written to its
+# .partial name, all the copies are flushed in ONE call, they are renamed, and the distinct directories they now sit in are flushed in ONE
+# call. A set is on the disk, renames included, before this returns, so whatever depends on it (the catalogs on the pictures; the agent on
+# the catalogs) is renamed only after.
+# CLAWD_FLUSH_CHUNK is a test seam that shortens the set to cross a set boundary with few files. It is 1 to 400; zero, text, a number with a
+# leading zero or one above 400 (or too long to compare) is 400, so 400 is a cap and not a default. (0 would make the loop take no file.)
+FLUSH_CHUNK="${CLAWD_FLUSH_CHUNK:-400}"
+case "$FLUSH_CHUNK" in ''|*[!0-9]*|0*) FLUSH_CHUNK=400 ;; *) [ "${#FLUSH_CHUNK}" -le 3 ] && [ "$FLUSH_CHUNK" -le 400 ] || FLUSH_CHUNK=400 ;; esac
+place_art_files() {
+  local repo="$1"
+  shift
+  place_files "$repo/art" "$ROOT/art" "$@"
+}
+# The same for any tree: each file $1/<rel> goes to $2/<rel> (the chat page's files go from $repo/chat-page to $ROOT/chat-page).
+place_files() {
+  local from="$1" to="$2" rel name dir seen files partials dirs
+  shift 2
+  while [ "$#" -gt 0 ]; do
+    files=(); partials=(); dirs=(); seen=$'\n'
+    while [ "$#" -gt 0 ] && [ "${#files[@]}" -lt "$FLUSH_CHUNK" ]; do
+      rel="$1"; shift
+      name="$to/$rel"
+      cp "$from/$rel" "$name.partial" || die "copy failed: $name"
+      files+=("$name"); partials+=("$name.partial")
+      dir="${name%/*}"
+      case "$seen" in *$'\n'"$dir"$'\n'*) ;; *) seen="$seen$dir"$'\n'; dirs+=("$dir") ;; esac
+    done
+    flush_durable "${partials[@]}" || die "could not flush the ${#partials[@]}-copy set starting at ${partials[0]} to the disk; none of it was moved into place"
+    for name in "${files[@]}"; do mv "$name.partial" "$name" || die "could not move $name into place"; done
+    flush_durable "${dirs[@]}" || die "could not flush the directories of the ${#files[@]}-file set starting at ${files[0]} to the disk after moving it into place"
+  done
+}
+
+# After a restart: waits up to $RESTART_WAIT_S s for a NEW agent process to have applied generation $2. The new process is told from the
+# old one ($1, possibly empty) by its launchd pid and by the pid it writes into status.json: the old process's appliedGeneration stays in
+# that file until the new one replaces it, so the generation alone would confirm too early. Returns 0 when confirmed, else 3 with
+# RESTART_WHY naming what was missing; NEW_PID is the new process when launchd showed one.
+wait_restarted() {
+  local old="$1" gen="$2" start pid recorded
+  start="$(now_ms)"
+  NEW_PID=""; RESTART_WHY="launchd shows no new agent process"
+  while :; do
+    pid="$(service_pid)"
+    if [ -n "$pid" ] && [ "$pid" != "$old" ]; then
+      NEW_PID="$pid"
+      recorded="$(json_value pid || true)"
+      if [ "$recorded" != "$pid" ]; then RESTART_WHY="the new agent process $pid has not yet written its pid into status.json"
+      elif applied_at_least "$gen"; then return 0
+      else RESTART_WHY="the new agent process $pid has not applied generation $gen"; fi
+    fi
+    [ "$(( $(now_ms) - start ))" -lt "$((RESTART_WAIT_S * 1000))" ] || return 3
+    sleep 0.1
+  done
+}
+
+cmd_update() {
+  trap 'on_update_signal 130' INT
+  trap 'on_update_signal 143' TERM
+  trap 'on_update_signal 129' HUP
+  local force_restart=0 repo build binary rel d f kind wanted added added_n installed_sha gen old_pid stale_partial marker_found
+  local src_sums dst_sums plan have_rel new_rel diff_rel batch batch_dir bad agent_changed cli_changed restart_needed
+  local page_new page_diff page_have page_src_sums page_dst_sums
+  case "${1:-}" in
+    "") ;;
+    --restart) force_restart=1; [ $# -eq 1 ] || die "update takes at most the one option --restart" ;;
+    *) die "update takes no argument except --restart" ;;
+  esac
+
+  # The source: what install would accept (nothing here changes anything).
+  repo="$(cd "$SELF_DIR/.." && pwd)"
+  [ -f "$repo/Package.swift" ] || die "update runs from the repo (scripts/update); this copy has no sources"
+  build="${CLAWD_BUILD_DIR:-$repo/.build/release}"
+  binary="$build/clawd-pet-agent"
+  [ -x "$binary" ] || die "build first: swift build -c release (missing $binary)"
+  [ -f "$repo/art/clawd-atlas.json" ] && [ -f "$repo/art/claude-code-elements.json" ] || die "art contract incomplete (atlas or elements missing)"
+  ls "$repo"/art/frames/*.png >/dev/null 2>&1 || die "art contract incomplete (no frames)"
+  collect_art_files "$repo" "nothing was changed"
+  collect_page_files "$repo" "nothing was changed"
+  verify_repo_launcher "$repo" "nothing was changed"
+
+  # The install: complete, and one this update can extend.
+  [ ! -L "$ROOT" ] && [ -d "$ROOT" ] || die "not installed: $ROOT does not exist; run scripts/install first (nothing was changed)"
+  # One update at a time from here to the end: everything below judges or changes what a second update would be changing too.
+  take_update_lock
+  if [ -e "$MARKER_PARTIAL" ] || [ -L "$MARKER_PARTIAL" ]; then
+    die "refusing: $MARKER_PARTIAL exists, so an install or an uninstall was cut short; inspect it, remove it yourself if it is a leftover, then run update again (nothing was changed)"
+  fi
+  [ -f "$MANIFEST" ] && [ ! -L "$MANIFEST" ] || die "not installed: $MANIFEST is missing; run scripts/install first (nothing was changed)"
+  [ -f "$MARKER" ] && [ ! -L "$MARKER" ] || die "the install marker $MARKER is missing, so this is not a complete install; run scripts/uninstall and scripts/install (nothing was changed)"
+  case "$(cat "$MARKER" 2>/dev/null)" in "root-created yes"|"root-created no") ;; *) die "the install marker $MARKER is unreadable; nothing was changed" ;; esac
+  [ -f "$PLIST" ] && [ ! -L "$PLIST" ] || die "the LaunchAgent plist is missing, so this is not a complete install; run scripts/uninstall and scripts/install (nothing was changed)"
+  load_manifest "$MANIFEST" "nothing was changed"
+  # A manifest.partial beside a complete manifest: install renames its partial away before any update can run, so it is an update's, and
+  # the lock says that update is not running. If it is provably such a leftover it is discarded below (after the last refusal); else refuse.
+  stale_partial=0
+  if [ -e "$MANIFEST_PARTIAL" ] || [ -L "$MANIFEST_PARTIAL" ]; then
+    manifest_partial_is_stale "$MANIFEST_PARTIAL" "$MANIFEST" || die "refusing: $MANIFEST_PARTIAL exists and is not provably the leftover of a cut update (that is a copy of this manifest with file and directory lines added); inspect it, remove it yourself if it is a leftover, then run update again (nothing was changed)"
+    stale_partial=1
+  fi
+  for f in "$AGENT" "$CLI_PATH" "$LAUNCHER" "$PLIST" "$CONTROL" "$CONTROL_LOCK" "$ROOT/art/clawd-atlas.json" "$ROOT/art/claude-code-elements.json"; do
+    grep -qxF -- "file $f" "$MANIFEST" || die "the manifest does not list $f, so this is not an install update can extend; nothing was changed"
+  done
+  [ -f "$CONTROL" ] && [ ! -L "$CONTROL" ] && [ -f "$CONTROL_LOCK" ] && [ ! -L "$CONTROL_LOCK" ] || die "control.json or control.lock is missing; run scripts/uninstall and scripts/install (nothing was changed)"
+
+  # The launcher: the program the plist names is the program macOS tracks, so update proves it is the recorded one and never replaces it.
+  if [ "$(/usr/bin/plutil -extract ProgramArguments raw -o - "$PLIST" 2>/dev/null)" != 1 ] || [ "$(/usr/bin/plutil -extract ProgramArguments.0 raw -o - "$PLIST" 2>/dev/null)" != "$LAUNCHER" ]; then
+    die "the LaunchAgent plist does not name the installed launcher $LAUNCHER; update never rewrites the plist, so uninstall and install again to adopt the launcher (nothing was changed)"
+  fi
+  [ -f "$LAUNCHER" ] && [ ! -L "$LAUNCHER" ] && [ -x "$LAUNCHER" ] || die "the installed launcher $LAUNCHER is missing or not an executable file; nothing was changed"
+  installed_sha="$(sha256_of "$LAUNCHER")" || die "cannot read the installed launcher; nothing was changed"
+  [ "$installed_sha" = "$launcher_sha" ] || die "the installed launcher (sha256 $installed_sha) is not the one recorded in launcher/clawd-pet-launch.sha256 ($launcher_sha); a different launcher is a different background item, so update never replaces it; uninstall and install again to adopt it (nothing was changed)"
+
+  # Every path update may write: no symlink on the way, a directory where a directory belongs.
+  art_dirs=()
+  while IFS= read -r d; do art_dirs+=("$ROOT/$d"); done < <(
+    for rel in "${art_rel[@]}"; do
+      d="art/${rel%/*}"
+      while [ "$d" != art ]; do printf '%s\n' "$d"; d="${d%/*}"; done
+    done | LC_ALL=C /usr/bin/sort -u)
+  for d in "$ROOT/art" ${art_dirs[@]+"${art_dirs[@]}"}; do
+    [ ! -L "$d" ] || die "refusing a symlinked directory: $d (nothing was changed)"
+    [ ! -e "$d" ] || [ -d "$d" ] || die "refusing: $d exists and is not a directory (nothing was changed)"
+  done
+  have_rel=()
+  for rel in "${art_rel[@]}" clawd-atlas.json claude-code-elements.json; do
+    f="$ROOT/art/$rel"
+    [ ! -L "$f" ] || die "refusing a symlink where an art file belongs: $f (nothing was changed)"
+    if [ -e "$f" ]; then [ -f "$f" ] || die "refusing: $f exists and is not a regular file (nothing was changed)"; have_rel+=("$rel"); fi
+  done
+
+  # The chat page (Stage 2): $ROOT/chat-page is a directory of regular files, and what differs from the source is new or replaced. The page is
+  # read at every open of the chat, so a changed page file needs no restart.
+  page_new=(); page_diff=(); page_have=()
+  if [ "${#page_rel[@]}" -gt 0 ]; then
+    [ ! -L "$ROOT/chat-page" ] || die "refusing a symlinked directory: $ROOT/chat-page (nothing was changed)"
+    [ ! -e "$ROOT/chat-page" ] || [ -d "$ROOT/chat-page" ] || die "refusing: $ROOT/chat-page exists and is not a directory (nothing was changed)"
+    for rel in "${page_rel[@]}"; do
+      f="$ROOT/chat-page/$rel"
+      [ ! -L "$f" ] || die "refusing a symlink where a chat page file belongs: $f (nothing was changed)"
+      if [ -e "$f" ]; then [ -f "$f" ] || die "refusing: $f exists and is not a regular file (nothing was changed)"; page_have+=("$rel"); fi
+    done
+    page_src_sums="$(printf '%s\n' "${page_rel[@]}" | sums_in "$repo/chat-page")" || die "cannot read the source chat page (nothing was changed)"
+    page_dst_sums=""
+    if [ "${#page_have[@]}" -gt 0 ]; then
+      page_dst_sums="$(printf '%s\n' "${page_have[@]}" | sums_in "$ROOT/chat-page")" || die "cannot read the installed chat page (nothing was changed)"
+    fi
+    plan="$( { printf '%s\n' "$page_src_sums" | /usr/bin/sed 's/^/S /'; printf '%s\n' "$page_dst_sums" | /usr/bin/sed 's/^/D /'; } | art_plan)" || die "cannot compare the chat page (nothing was changed)"
+    while read -r kind rel; do
+      case "$kind" in new) page_new+=("$rel") ;; diff) page_diff+=("$rel") ;; esac
+    done < <(printf '%s\n' "$plan")
+  fi
+  # What differs: by content, with one shasum process per 200 files.
+  src_sums="$(printf '%s\n' "${art_rel[@]}" clawd-atlas.json claude-code-elements.json | sums_in "$repo/art")" || die "cannot read the source art (nothing was changed)"
+  dst_sums="$(printf '%s\n' "${have_rel[@]}" | sums_in "$ROOT/art")" || die "cannot read the installed art (nothing was changed)"
+  plan="$( { printf '%s\n' "$src_sums" | /usr/bin/sed 's/^/S /'; printf '%s\n' "$dst_sums" | /usr/bin/sed 's/^/D /'; } | art_plan)" || die "cannot compare the art (nothing was changed)"
+  new_rel=(); diff_rel=()
+  while read -r kind rel; do
+    case "$kind" in new) new_rel+=("$rel") ;; diff) diff_rel+=("$rel") ;; esac
+  done < <(printf '%s\n' "$plan")
+  agent_changed=1; cmp -s "$binary" "$AGENT" 2>/dev/null && agent_changed=0
+  cli_changed=1; cmp -s "$repo/bin/clawd-pet" "$CLI_PATH" 2>/dev/null && cli_changed=0
+  # The running agent has read the agent, the two catalogs and every picture it has drawn; a picture that was not there it has not.
+  restart_needed=$agent_changed
+  [ "${#diff_rel[@]}" -eq 0 ] || restart_needed=1
+  for rel in ${new_rel[@]+"${new_rel[@]}"}; do case "$rel" in */*) ;; *) restart_needed=1 ;; esac; done
+  # An earlier update that was cut after its first copy (or before its restart was confirmed) left the marker: the files on disk may all be
+  # current already, and the running agent still holds the old ones in memory.
+  marker_found=0
+  if [ -e "$RESTART_MARKER" ] || [ -L "$RESTART_MARKER" ]; then
+    [ -f "$RESTART_MARKER" ] && [ ! -L "$RESTART_MARKER" ] || die "refusing: $RESTART_MARKER is not a regular file (nothing was changed)"
+    marker_found=1; restart_needed=1
+  fi
+  # The focus-violation ledger. An ordinary update never touches an existing one. An install whose manifest does not list it is adopted: the
+  # ledger is created (how=adopt-update) and the agent is restarted, so its first BOOT line is written. A listed ledger that is absent is
+  # recreated (how=recreate) only to let an interrupted update finish: while the restart marker exists, or while the installed agent is not
+  # yet this build; otherwise it stays missing and is reported.
+  ledger_action=none
+  if [ -e "$LEDGER" ] || [ -L "$LEDGER" ]; then
+    [ -f "$LEDGER" ] && [ ! -L "$LEDGER" ] || die "refusing: $LEDGER is not a regular file (nothing was changed)"
+    grep -qxF -- "file $LEDGER" "$MANIFEST" || die "refusing: $LEDGER exists and the manifest does not list it; uninstall and install again (nothing was changed)"
+  elif ! grep -qxF -- "file $LEDGER" "$MANIFEST"; then
+    ledger_action=adopt-update; restart_needed=1
+  elif [ "$marker_found" = 1 ] || [ "$agent_changed" = 1 ]; then
+    ledger_action=recreate
+  else
+    echo "clawd-pet: the focus-violation ledger $LEDGER is missing; update does not recreate it (the attended check reports NOT RUN ledger-missing)"
+  fi
+
+  # The manifest lines this update adds: files and directories not yet recorded, and the .partial name of every file it replaces.
+  wanted="$(update_manifest_lines)"
+  added="$(printf '%s\n' "$wanted" | /usr/bin/awk 'NR == FNR { have[$0] = 1; next } !($0 in have) && !($0 in seen) { seen[$0] = 1; print }' "$MANIFEST" -)" || die "cannot compare with the manifest (nothing was changed)"
+  added_n=0; [ -z "$added" ] || added_n="$(printf '%s\n' "$added" | grep -c '')"
+  grep -q '^log ' "$MANIFEST" || die "the manifest has no log line, so it is not one update can extend (nothing was changed)"
+
+  # Every refusal is behind us: discard the leftover, so the manifest below can be written through the name it occupied.
+  if [ "$stale_partial" = 1 ]; then
+    rm -f -- "$MANIFEST_PARTIAL" || die "cannot remove the stale $MANIFEST_PARTIAL"
+    echo "clawd-pet: discarded a stale manifest.partial (an earlier update was cut before it published its manifest; no other update is running)."
+  fi
+  if [ "$added_n" -eq 0 ] && [ "${#new_rel[@]}" -eq 0 ] && [ "${#diff_rel[@]}" -eq 0 ] && [ "${#page_new[@]}" -eq 0 ] && [ "${#page_diff[@]}" -eq 0 ] && [ "$agent_changed" = 0 ] && [ "$cli_changed" = 0 ] && [ "$force_restart" = 0 ] && [ "$marker_found" = 0 ] && [ "$ledger_action" = none ]; then
+    # Nothing to place, but an earlier run that only restored missing pictures (no restart, so no marker) may have been cut, or its flush
+    # may have failed, after it renamed them and before it flushed their directory: this is the only step left that makes those renames
+    # durable, so the art tree is flushed here too, as it is before the catalogs on every run that places something.
+    flush_durable "$ROOT/art" ${art_dirs[@]+"${art_dirs[@]}"} || die "could not flush the directories of $ROOT/art to the disk (nothing else was changed)"
+    echo "clawd-pet: already up to date; nothing changed, nothing restarted."
+    return 0
+  fi
+
+  # --- from here on files change -----------------------------------------------------------------------------------------
+  UPDATE_STARTED=1
+  if [ "$added_n" -gt 0 ]; then
+    # The union: the lines install wrote, with the new file and directory lines before the first log line (new directories parents first).
+    ( set -C; : > "$MANIFEST_PARTIAL" ) 2>/dev/null || die "cannot create $MANIFEST_PARTIAL (another update running?)"
+    UPDATE_PARTIAL_OWNED=1
+    { printf '%s\n' "$added" | /usr/bin/sed 's/^/N /'; /usr/bin/sed 's/^/M /' "$MANIFEST"; } | /usr/bin/awk '
+      $1 == "N" && !m { add[++k] = substr($0, 3); next }
+      { m = 1; line = substr($0, 3) }
+      !done && line ~ /^log / { for (i = 1; i <= k; i++) print add[i]; done = 1 }
+      { print line }
+      END { exit done ? 0 : 3 }' > "$MANIFEST_PARTIAL" || die "cannot write the new manifest"
+    # The new manifest has to read exactly as the old one does (every line a known kind, every path inside the install) and be longer by
+    # the lines added; a line that is not what it should be stops the update before the manifest is replaced.
+    [ "$(/usr/bin/sed -n 1p "$MANIFEST_PARTIAL")" = "schema 1" ] && [ "$(grep -c '' "$MANIFEST_PARTIAL")" = "$(( $(grep -c '' "$MANIFEST") + added_n ))" ] || die "the new manifest is not complete; nothing was changed"
+    load_manifest "$MANIFEST_PARTIAL" "the new manifest was not used"
+    publish_file "$MANIFEST_PARTIAL" "$MANIFEST" "cannot publish the new manifest"
+    UPDATE_PARTIAL_OWNED=0
+  fi
+  # The manifest lists the marker now. From before the first copy until the restart is confirmed, a plain update restarts the agent: a cut
+  # anywhere in between would otherwise leave files that match, "already up to date", and an agent that has not read them.
+  if [ "$restart_needed" = 1 ] && [ "$marker_found" = 0 ]; then
+    : > "$RESTART_MARKER" || die "cannot create $RESTART_MARKER"
+  fi
+  # The ledger comes after the manifest that names it and the restart marker, and before the first file copy and the agent swap: no
+  # ledger-aware agent can run before it exists.
+  if [ "$ledger_action" != none ]; then create_ledger "$ledger_action"; fi
+  # New directories, parents first, in one mkdir.
+  batch=()
+  for d in ${art_dirs[@]+"${art_dirs[@]}"}; do [ -d "$d" ] || batch+=("$d"); done
+  if [ "${#batch[@]}" -gt 0 ]; then mkdir -- "${batch[@]}" || die "cannot create the new art directories"; fi
+  # The pictures, new and replaced alike, are one set (see place_art_files): every copy goes to a .partial name, is flushed, is renamed, and its
+  # directory is flushed, so a file at its final name was on the disk before it got there, and a catalog never names a picture whose bytes or
+  # directory entry are not.
+  batch=()
+  for rel in ${diff_rel[@]+"${diff_rel[@]}"} ${new_rel[@]+"${new_rel[@]}"}; do
+    case "$rel" in */*) batch+=("$rel") ;; esac
+  done
+  if [ "${#batch[@]}" -gt 0 ]; then place_art_files "$repo" "${batch[@]}"; fi
+  # Every directory of the art tree, in one call, whatever this run copied: art/, each directory that holds a picture and the parents between
+  # (so the parents of the directories this run made are in it). A re-run finds renamed pictures that match and leaves them out of the set
+  # above, and the flush that was to make their renames durable may be the one that failed or was cut; this is what makes it. Before the
+  # catalogs, because they name the pictures.
+  flush_durable "$ROOT/art" ${art_dirs[@]+"${art_dirs[@]}"} || die "could not flush the directories of $ROOT/art to the disk; the catalogs, the agent and the CLI were not moved into place"
+  # The catalogs come last, in a set of their own.
+  batch=()
+  for rel in ${diff_rel[@]+"${diff_rel[@]}"} ${new_rel[@]+"${new_rel[@]}"}; do
+    case "$rel" in */*) ;; *) batch+=("$rel") ;; esac
+  done
+  if [ "${#batch[@]}" -gt 0 ]; then place_art_files "$repo" "${batch[@]}"; fi
+  # The chat page: its directory, then its new and replaced files as one set (each through a .partial name, flushed before it is renamed).
+  if [ "${#page_rel[@]}" -gt 0 ] && [ ! -d "$ROOT/chat-page" ]; then mkdir -- "$ROOT/chat-page" || die "cannot create $ROOT/chat-page"; fi
+  batch=()
+  for rel in ${page_diff[@]+"${page_diff[@]}"} ${page_new[@]+"${page_new[@]}"}; do batch+=("$rel"); done
+  if [ "${#batch[@]}" -gt 0 ]; then place_files "$repo/chat-page" "$ROOT/chat-page" "${batch[@]}"; fi
+  # Each executable is proved by its sha256 before it gets its final name (a copy that "succeeded" and is wrong never goes live).
+  if [ "$agent_changed" = 1 ]; then copy_executable "$binary" "$AGENT" "$(sha256_of "$binary")"; fi
+  if [ "$cli_changed" = 1 ]; then copy_executable "$repo/bin/clawd-pet" "$CLI_PATH" "$(sha256_of "$repo/bin/clawd-pet")"; fi
+
+  # Prove the result before anything is restarted.
+  dst_sums="$(printf '%s\n' "${art_rel[@]}" clawd-atlas.json claude-code-elements.json | sums_in "$ROOT/art")" || die "cannot read the installed art back"
+  bad="$( { printf '%s\n' "$src_sums" | /usr/bin/sed 's/^/S /'; printf '%s\n' "$dst_sums" | /usr/bin/sed 's/^/D /'; } | art_plan)"
+  [ -z "$bad" ] || die "the installed art differs from the source after the copy: $(printf '%s' "$bad" | head -n 3 | tr '\n' ' ')"
+  if [ "${#page_rel[@]}" -gt 0 ]; then
+    page_dst_sums="$(printf '%s\n' "${page_rel[@]}" | sums_in "$ROOT/chat-page")" || die "cannot read the installed chat page back"
+    bad="$( { printf '%s\n' "$page_src_sums" | /usr/bin/sed 's/^/S /'; printf '%s\n' "$page_dst_sums" | /usr/bin/sed 's/^/D /'; } | art_plan)"
+    [ -z "$bad" ] || die "the installed chat page differs from the source after the copy: $(printf '%s' "$bad" | head -n 3 | tr '\n' ' ')"
+  fi
+  cmp -s "$binary" "$AGENT" || die "the installed agent differs from the build after the copy"
+  cmp -s "$repo/bin/clawd-pet" "$CLI_PATH" || die "the installed CLI differs from the repo's after the copy"
+  UPDATE_STARTED=0   # every file is in place and proved; what follows is only the restart (the marker, when there is one, makes update run again finish it)
+  if [ "$restart_needed" = 1 ]; then RESTART_MARKED=1; fi
+
+  echo "clawd-pet: updated: agent $([ "$agent_changed" = 1 ] && echo replaced || echo unchanged), CLI $([ "$cli_changed" = 1 ] && echo replaced || echo unchanged), art ${#new_rel[@]} added and ${#diff_rel[@]} replaced; the plist and the launcher were not touched."
+  if [ "${#page_new[@]}" -gt 0 ] || [ "${#page_diff[@]}" -gt 0 ]; then
+    echo "clawd-pet: chat page ${#page_new[@]} added and ${#page_diff[@]} replaced (the chat reads it each time it opens)."
+  fi
+  if [ "$restart_needed" = 0 ] && [ "$force_restart" = 0 ]; then
+    echo "clawd-pet: nothing the running agent has read changed, so it was not restarted."
+    return 0
+  fi
+  if ! is_loaded; then
+    clear_restart_marker   # nothing is running on the old files: whatever starts next reads the new ones
+    echo "clawd-pet: the agent is not running; 'clawd-pet start' runs the new build."
+    return 0
+  fi
+  old_pid="$(service_pid)"
+  # Said before the restart is sent, so it claims no restart: the one that finished it is the confirmed line below.
+  if [ "$marker_found" = 1 ]; then echo "clawd-pet: an earlier update was cut before its restart was confirmed; restart pending."; fi
+  "$LAUNCHCTL" kickstart -k "$DOMAIN/$LABEL" 8<&- || die "the files are updated, but launchctl kickstart -k failed; the restart is still pending; run 'clawd-pet stop' and 'clawd-pet start' to run the new build"
+  gen="$(/usr/bin/plutil -extract generation raw -o - "$CONTROL" 2>/dev/null)" || gen=0
+  case "$gen" in ''|*[!0-9]*) gen=0 ;; esac
+  if wait_restarted "$old_pid" "$gen"; then
+    clear_restart_marker
+    echo "clawd-pet: restarted the agent (pid ${old_pid:-none} -> $NEW_PID); it applied settings generation $gen."
+    if [ "$marker_found" = 1 ]; then echo "clawd-pet: the agent is restarted onto the installed files."; fi
+    return 0
+  fi
+  echo "clawd-pet: the files are updated, but the restarted agent did not confirm within $RESTART_WAIT_S s: $RESTART_WHY; restart pending. Check 'clawd-pet status'; if the pet is not running, 'clawd-pet start'. Until a restart is confirmed, running update again restarts the agent once more." >&2
+  return 3
+}
+
+# Removes the restart marker once the agent is known to run the installed files (or is not running). A marker that cannot be removed only
+# costs one more restart at the next update, so this warns and goes on.
+clear_restart_marker() {
+  if [ -e "$RESTART_MARKER" ] || [ -L "$RESTART_MARKER" ]; then
+    rm -f -- "$RESTART_MARKER" || echo "clawd-pet: warning: could not remove $RESTART_MARKER; the next update restarts the agent once more" >&2
+  fi
+  RESTART_MARKED=0
+}
+
+# --- uninstall -------------------------------------------------------------------------------------------------
+
+# Prints the live pids of the installed agent path, one "PID p sec usec" per line, then verifies the footer.
+# A missing OWN-PIDS line, a bad line or a nonzero exit is a failure, never "none".
+own_pids() {
+  [ -x "$OWN_PIDS_CHECKER" ] || die "cannot enumerate processes: $OWN_PIDS_CHECKER is not executable; files retained"
+  # The enumeration aborts when the kernel refuses to describe a process that is mid-exec or mid-exit (EPERM, observed under
+  # process churn, about one call in a hundred while a test run forks hundreds of processes). That says nothing about the install,
+  # so a few quick retries; five failures in a row still fail closed.
+  tries=0
+  while :; do
+    out="$("$OWN_PIDS_CHECKER" --own-pids 2>/dev/null </dev/null)"; rc=$?
+    [ "$rc" -eq 0 ] && break
+    tries=$((tries + 1))
+    [ "$tries" -lt 5 ] || die "process enumeration failed (exit $rc after $tries tries); files retained; retry after process starts and exits settle"
+    sleep 0.1
+  done
+  footer="$(printf '%s\n' "$out" | tail -n 1)"
+  case "$footer" in "OWN-PIDS "[0-9]*) ;; *) die "process enumeration gave no OWN-PIDS line; files retained" ;; esac
+  count=0
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    case "$l" in
+      "OWN-PIDS "*) ;;
+      PID\ [0-9]*\ [0-9]*\ [0-9]*) count=$((count + 1)); echo "$l" ;;
+      *) die "malformed enumeration line; files retained" ;;
+    esac
+  done < <(printf '%s\n' "$out")
+  [ "$footer" = "OWN-PIDS $count" ] || die "enumeration count mismatch; files retained"
+}
+
+# Sends signal $1 (TERM or KILL) to the pid in listing line $2 ("PID pid sec usec") only if the process is still the one that was
+# listed. The identity (exact installed-agent path, which the enumeration filters on, plus the start time) is read again immediately
+# before the signal, so a process that exited and a pid that was reused since the earlier listing are never signalled.
+signal_if_same() {
+  local sig="$1" line="$2" fresh pid
+  fresh="$(own_pids)" || exit 2
+  printf '%s\n' "$fresh" | grep -qxF -- "$line" || return 0
+  set -- $line; pid="$2"
+  kill "-$sig" "$pid" 2>/dev/null
+  return 0
+}
+
+safe_path() { # absolute, no .., no symlink, inside the install
+  case "$1" in /*) ;; *) die "manifest path is not absolute: $1" ;; esac
+  case "/$1/" in */../*|*/./*) die "manifest path traverses: $1" ;; esac
+  case "$1" in
+    "$ROOT"|"$ROOT"/*|"$CLI_PATH"|"$CLI_PATH.partial"|"$PLIST"|"$MARKER"|"$HOME/bin"|"$HOME/Library"|"$HOME/Library/LaunchAgents"|"$HOME/Library/Application Support") ;;
+    *) die "manifest path outside the installation: $1" ;;
+  esac
+  [ ! -L "$1" ] || die "manifest entry is a symlink: $1"
+}
+
+# Reads the complete manifest file $1 into snap_files, snap_dirs and snap_logs (logbase lines are accepted and ignored) and checks every
+# path in it with safe_path. $2 is the clause every refusal ends with ("nothing removed", "nothing was changed").
+load_manifest() {
+  local l schema="" seen_end=0 p
+  snap_files=(); snap_dirs=(); snap_logs=()
+  while IFS= read -r l; do
+    if [ "$seen_end" = 1 ] && [ -n "$l" ]; then die "the manifest has lines after its end; $2"; fi
+    case "$l" in
+      "schema "*) schema="${l#schema }" ;;
+      "file "*) snap_files+=("${l#file }") ;;
+      "dir "*) snap_dirs+=("${l#dir }") ;;
+      "log "*) snap_logs+=("${l#log }") ;;
+      "logbase "*) ;;
+      "end") seen_end=1 ;;
+      "") ;;
+      *) die "unknown manifest line; $2" ;;
+    esac
+  done < "$1"
+  [ "$schema" = "1" ] || die "unknown manifest schema; $2"
+  [ "$seen_end" = 1 ] || die "the manifest is incomplete (no end line); $2"
+  for p in ${snap_files[@]+"${snap_files[@]}"} ${snap_dirs[@]+"${snap_dirs[@]}"} ${snap_logs[@]+"${snap_logs[@]}"}; do safe_path "$p"; done
+}
+
+# Live-writer check. A process that outlives a killed installer (a copy child, for instance) can still create files after
+# uninstall removed them, so uninstall refuses while any process has a command line that names $ROOT, $CLI_PATH or $PLIST.
+# Listing only: this output is never used to choose a process to signal. Excluded: the agents listed in $1 (uninstall stops
+# those itself), this process, every ancestor of it (so `~/bin/clawd-pet uninstall` does not refuse itself) and its descendants.
+check_live_writers() {
+  local listing="$1" skip="" l pid table writers
+  while IFS= read -r l; do
+    case "$l" in PID\ [0-9]*) pid="${l#PID }"; skip="$skip ${pid%% *}" ;; esac
+  done < <(printf '%s\n' "$listing")
+  table="$(LC_ALL=en_US.UTF-8 /bin/ps -axww -o pid=,ppid=,command= 2>/dev/null)" || die "cannot list processes to look for a live writer; nothing removed"
+  [ -n "$table" ] || die "the process listing was empty; nothing removed"
+  writers="$(printf '%s\n' "$table" | CLAWD_NEEDLE_ROOT="$ROOT" CLAWD_NEEDLE_CLI="$CLI_PATH" CLAWD_NEEDLE_PLIST="$PLIST" CLAWD_ME="$$" CLAWD_SKIP="$skip" /usr/bin/awk '
+    {
+      line = $0; sub(/^ +/, "", line)
+      n = index(line, " "); pid = substr(line, 1, n - 1); rest = substr(line, n + 1); sub(/^ +/, "", rest)
+      m = index(rest, " "); parent[pid] = substr(rest, 1, m - 1); command[pid] = substr(rest, m + 1); order[++count] = pid
+    }
+    END {
+      me = ENVIRON["CLAWD_ME"] ""
+      p = me; skipped[p] = 1; guard = 0
+      while ((p in parent) && (parent[p] "") != "" && (parent[p] "") != "0" && guard < 100000) { p = parent[p] ""; skipped[p] = 1; guard++ }
+      k = split(ENVIRON["CLAWD_SKIP"], listed, " "); for (j = 1; j <= k; j++) skipped[listed[j] ""] = 1
+      for (i = 1; i <= count; i++) {
+        pid = order[i] ""
+        if (pid in skipped) continue
+        q = pid; descendant = 0; guard = 0
+        while ((q in parent) && guard < 100000) { q = parent[q] ""; if (q == me) { descendant = 1; break } guard++ }
+        if (descendant) continue
+        c = command[pid]
+        if (index(c, ENVIRON["CLAWD_NEEDLE_ROOT"]) || index(c, ENVIRON["CLAWD_NEEDLE_CLI"]) || index(c, ENVIRON["CLAWD_NEEDLE_PLIST"])) print pid ": " substr(c, 1, 160)
+      }
+    }')" || die "could not read the process listing; nothing removed"
+  if [ -n "$writers" ]; then
+    echo "clawd-pet: refusing: a process is still using the installation (it may be a copy left by an interrupted install):" >&2
+    while IFS= read -r l; do echo "  pid $l" >&2; done < <(printf '%s\n' "$writers")
+    if [ "$PLIST_REMOVED" = 1 ]; then die "no other file was removed; retry after it exits"; fi
+    die "nothing was removed; retry after it exits"
+  fi
+}
+
+# Boots the label out and requires it to be unloaded.
+stop_service() {
+  "$LAUNCHCTL" bootout "$DOMAIN/$LABEL" >/dev/null 2>&1
+  wait_unloaded || die "LaunchAgent is still loaded 10 s after bootout; files retained"
+}
+
+# Removes the regular files named in $@. One rm for the lot; when it fails, one rm per name, so the message names the file.
+remove_files() {
+  rm -- "$@" 2>/dev/null && return 0
+  local f
+  for f in "$@"; do
+    if [ -e "$f" ] || [ -L "$f" ]; then rm -- "$f" || die "could not remove $f"; fi
+  done
+  return 0
+}
+
+cmd_uninstall() {
+  # The process enumerator: a test override, else the installed agent, else the repo build when this runs from the repo.
+  if [ -n "${CLAWD_OWN_PIDS_CHECKER:-}" ]; then
+    OWN_PIDS_CHECKER="$CLAWD_OWN_PIDS_CHECKER"
+  elif [ -x "$AGENT" ]; then
+    OWN_PIDS_CHECKER="$AGENT"
+  elif [ -f "$SELF_DIR/../Package.swift" ] && [ -x "$SELF_DIR/../.build/release/clawd-pet-agent" ]; then
+    OWN_PIDS_CHECKER="$SELF_DIR/../.build/release/clawd-pet-agent"
+  else
+    die "cannot enumerate processes: the installed agent is missing; run scripts/uninstall from the repo after swift build -c release; nothing removed"
+  fi
+
+  # The install marker says whether the install created $ROOT.
+  root_created=no; marker=absent; stale_partial=0
+  if [ -e "$MARKER" ] || [ -L "$MARKER" ]; then
+    [ -f "$MARKER" ] && [ ! -L "$MARKER" ] || die "the install marker $MARKER is not a regular file; nothing removed"
+    case "$(cat "$MARKER" 2>/dev/null)" in
+      "root-created yes") root_created=yes ;;
+      "root-created no") root_created=no ;;
+      *) die "the install marker $MARKER is unreadable; nothing removed" ;;
+    esac
+    marker=present
+  fi
+  [ ! -L "$ROOT" ] || die "refusing a symlinked directory: $ROOT"
+
+  # What is there to remove: a complete manifest, an interrupted install (marker, no manifest) or a stray marker partial.
+  mode=""; snap_files=(); snap_dirs=(); snap_logs=()
+  if [ -e "$MANIFEST" ] || [ -L "$MANIFEST" ]; then
+    [ -f "$MANIFEST" ] && [ ! -L "$MANIFEST" ] || die "the manifest $MANIFEST is not a regular file; nothing removed"
+    mode=manifest
+    # The update lock, for the whole run: no update is writing a manifest.partial or any other file while this removes them, and none can
+    # start (it would be refused for the same reason). It is the lock that makes the stale-partial rule below sound.
+    take_update_lock uninstall
+    load_manifest "$MANIFEST" "nothing removed"
+    # install renames manifest.partial to manifest, so the two never exist together: the only writer of one is an update. With the lock held
+    # no update is running, so a manifest.partial that provably is a cut update's leftover (the rule `update` uses) is discarded below,
+    # after the last refusal; anything else is refused by name.
+    if [ -e "$MANIFEST_PARTIAL" ] || [ -L "$MANIFEST_PARTIAL" ]; then
+      manifest_partial_is_stale "$MANIFEST_PARTIAL" "$MANIFEST" || die "$MANIFEST_PARTIAL sits beside a complete manifest and is not provably the leftover of a cut update (that is a copy of this manifest with file and directory lines added); it is not removed and nothing was removed; inspect it, remove it yourself, then run uninstall again"
+      stale_partial=1
+    fi
+  elif [ "$marker" = present ]; then
+    mode=interrupted
+    unexpected=()
+    while IFS= read -r entry; do
+      case "$entry" in
+        manifest.partial|agent.log|agent.log.1) ;;
+        *) unexpected+=("$entry") ;;
+      esac
+    done < <(root_entries)
+    if [ "${#unexpected[@]}" -gt 0 ]; then die "an install started but left no manifest, and $ROOT holds ${unexpected[*]}; nothing removed"; fi
+    if [ -e "$MANIFEST_PARTIAL" ] || [ -L "$MANIFEST_PARTIAL" ]; then
+      [ -f "$MANIFEST_PARTIAL" ] && [ ! -L "$MANIFEST_PARTIAL" ] || die "$MANIFEST_PARTIAL is not a regular file; nothing removed"
+    fi
+  elif [ -f "$MARKER_PARTIAL" ] && [ ! -L "$MARKER_PARTIAL" ] && [ ! -e "$MANIFEST_PARTIAL" ]; then
+    mode=stray
+  else
+    die "no record of an install (no manifest at $MANIFEST, no marker at $MARKER); nothing removed"
+  fi
+
+  stop_service
+  if [ "$mode" = manifest ]; then
+    # The plist goes before any process step. Without it `clawd-pet start` dies at installed() and launchd cannot load the job
+    # (bootstrap fails, and nothing starts it at login), so no agent can come up between the final enumeration and the removal of
+    # its files. The plist stays listed in the manifest: a rerun finds it already gone. The second bootout takes down a start
+    # that got in after the first one.
+    for f in ${snap_files[@]+"${snap_files[@]}"}; do
+      [ "$f" = "$PLIST" ] || continue
+      if [ -e "$f" ]; then
+        [ -f "$f" ] || die "manifest entry is not a regular file: $f"
+        rm -- "$f" || die "could not remove $f"
+        PLIST_REMOVED=1
+      fi
+    done
+    stop_service
+  fi
+
+  first="$(own_pids)" || exit 2
+  check_live_writers "$first"
+  if [ -n "$first" ]; then
+    while IFS= read -r l; do
+      signal_if_same TERM "$l"
+    done < <(printf '%s\n' "$first")
+    sleep 2
+    second="$(own_pids)" || exit 2
+    if [ -n "$second" ]; then
+      while IFS= read -r l; do
+        # Kill only a pid whose path (it is still listed) and start time still match the first listing, re-checked right before the signal.
+        if printf '%s\n' "$first" | grep -qxF "$l"; then
+          signal_if_same KILL "$l"
+        fi
+      done < <(printf '%s\n' "$second")
+    fi
+  fi
+  n=0
+  while [ "$n" -lt 20 ]; do
+    remaining="$(own_pids)" || exit 2
+    [ -z "$remaining" ] && break
+    sleep 0.05; n=$((n + 1))
+  done
+  [ -z "$remaining" ] || die "an installed process remains; files retained for a retry"
+
+  case "$mode" in
+    stray)
+      rm -- "$MARKER_PARTIAL" || die "could not remove $MARKER_PARTIAL"
+      echo "clawd-pet: removed a stray install marker; nothing else had been installed."
+      return 0 ;;
+    interrupted)
+      if [ -f "$MANIFEST_PARTIAL" ]; then rm -- "$MANIFEST_PARTIAL" || die "could not remove $MANIFEST_PARTIAL"; fi
+      if [ "$root_created" = yes ] && [ -d "$ROOT" ] && [ -z "$(root_entries)" ]; then
+        rmdir -- "$ROOT" || die "could not remove $ROOT; the marker is kept for a retry"
+      fi
+      rm -- "$MARKER" || die "could not remove the install marker $MARKER"
+      for l in "$ROOT/agent.log" "$ROOT/agent.log.1"; do [ -f "$l" ] && echo "Retained log: $l"; done
+      echo "clawd-pet: removed an interrupted install."
+      return 0 ;;
+  esac
+
+  # The ledger goes with the install, so its count is said first: the number is not lost with the file. No agent is running now.
+  for f in ${snap_files[@]+"${snap_files[@]}"}; do
+    [ "$f" = "$LEDGER" ] || continue
+    if [ -f "$f" ] && [ ! -L "$f" ]; then
+      ledger_born="$(/usr/bin/sed -n '1s/^LEDGER 1 born=\([0-9][0-9]*\) how=.*$/\1/p' "$f" 2>/dev/null)"
+      ledger_count="$(grep -c ' VIOLATION ' "$f" 2>/dev/null)"
+      echo "clawd-pet: focus violations recorded: ${ledger_count:-0}, ledger born ${ledger_born:-unknown}"
+    else
+      echo "clawd-pet: focus violations recorded: unknown (no ledger at $f)"
+    fi
+  done
+  # A complete manifest. Every refusal is behind us: a stale manifest.partial goes first (it is not in the manifest, so the residue check
+  # would otherwise count it), then single-file removals only; the manifest and the marker stay until the end.
+  if [ "$stale_partial" = 1 ]; then
+    rm -f -- "$MANIFEST_PARTIAL" || die "could not remove the stale $MANIFEST_PARTIAL"
+    echo "clawd-pet: discarded a stale manifest.partial (an earlier update was cut before it published its manifest; no other update is running)."
+  fi
+  # Each file is named and checked on its own; the rm calls take up to 100 of them at once (an art tree is over two thousand files,
+  # and a process per file takes minutes). rm is never given a directory: every name was just checked to be a regular file.
+  batch=()
+  for f in ${snap_files[@]+"${snap_files[@]}"}; do
+    [ "$f" = "$MANIFEST" ] && continue
+    [ "$f" = "$MARKER" ] && continue
+    if [ -e "$f" ]; then
+      [ -f "$f" ] || die "manifest entry is not a regular file: $f"
+      batch+=("$f")
+      if [ "${#batch[@]}" -ge 100 ]; then remove_files "${batch[@]}"; batch=(); fi
+    fi
+  done
+  if [ "${#batch[@]}" -gt 0 ]; then remove_files "${batch[@]}"; batch=(); fi
+  # The Aqua diagnostics file is written by the agent of this build on; a manifest made before it has no line for it, so it goes by name.
+  if [ -e "$ROOT/aqua-diag.log" ] || [ -L "$ROOT/aqua-diag.log" ]; then
+    [ -f "$ROOT/aqua-diag.log" ] && [ ! -L "$ROOT/aqua-diag.log" ] || die "$ROOT/aqua-diag.log is not a regular file; nothing more was removed"
+    remove_files "$ROOT/aqua-diag.log"
+  fi
+  # The Settings window's reopen request after a restart is written by the agent of this build on; it goes by name too.
+  if [ -e "$ROOT/open-settings" ] || [ -L "$ROOT/open-settings" ]; then
+    [ -f "$ROOT/open-settings" ] && [ ! -L "$ROOT/open-settings" ] || die "$ROOT/open-settings is not a regular file; nothing more was removed"
+    remove_files "$ROOT/open-settings"
+  fi
+  # Empty directories only, children first, never $ROOT itself; a directory that still holds something stays.
+  i=$((${#snap_dirs[@]} - 1))
+  while [ "$i" -ge 0 ]; do
+    [ "${snap_dirs[$i]}" = "$ROOT" ] || rmdir -- "${snap_dirs[$i]}" 2>/dev/null
+    i=$((i - 1))
+  done
+  # Residue check before the manifest goes: a retry still needs its record. Retained logs are not residue.
+  residue=()
+  for f in ${snap_files[@]+"${snap_files[@]}"}; do
+    [ "$f" = "$MANIFEST" ] && continue
+    [ "$f" = "$MARKER" ] && continue
+    if [ -e "$f" ] || [ -L "$f" ]; then residue+=("$f"); fi
+  done
+  while IFS= read -r entry; do
+    case "$entry" in
+      manifest|agent.log|agent.log.1) ;;
+      *) residue+=("$ROOT/$entry") ;;
+    esac
+  done < <(root_entries)
+  if [ "${#residue[@]}" -gt 0 ]; then
+    echo "clawd-pet: could not remove everything; still present:" >&2
+    for f in "${residue[@]}"; do echo "  $f" >&2; done
+    echo "clawd-pet: the manifest and the install marker are kept so a retry still has its record" >&2
+    exit 2
+  fi
+  rm -- "$MANIFEST" || die "could not remove the manifest"
+  if [ "$root_created" = yes ] && [ -d "$ROOT" ] && [ -z "$(root_entries)" ]; then
+    rmdir -- "$ROOT" || die "could not remove $ROOT; the marker is kept for a retry"
+  fi
+  if [ -e "$MARKER" ]; then rm -- "$MARKER" || die "could not remove the install marker $MARKER"; fi
+  for l in ${snap_logs[@]+"${snap_logs[@]}"}; do [ -f "$l" ] && echo "Retained log: $l"; done
+  echo "clawd-pet: uninstalled."
+  return 0
+}
+
+# A setting takes exactly its words: an extra word is a usage error, not something to ignore.
+case "${1:-help}" in
+  size|helmet|walk|motion|look-every|look|full-screen) [ $# -le 2 ] || { usage >&2; exit 2; } ;;
+  bubble|chat) [ $# -le 3 ] || { usage >&2; exit 2; } ;;
+  # Only aqua react takes a third word; follow, ignore and auto take two, so an empty third word is refused too.
+  aqua) if [ "${2:-}" = react ]; then [ $# -le 3 ]; else [ $# -le 2 ]; fi || { usage >&2; exit 2; } ;;
+esac
+case "${1:-help}" in
+  help|-h|--help) usage ;;
+  status) cmd_status ;;
+  start) cmd_start ;;
+  stop) cmd_stop ;;
+  size) cmd_size "${2:-}" ;;
+  helmet) cmd_helmet "${2:-}" ;;
+  look) cmd_look "${2:-}" ;;
+  aqua) cmd_aqua "${2:-}" "${3:-}" ;;
+  full-screen) cmd_full_screen "${2:-}" ;;
+  walk) cmd_walk "${2:-}" ;;
+  motion) cmd_motion "${2:-}" ;;
+  look-every) cmd_look_every "${2:-}" ;;
+  bubble) cmd_bubble "${2:-}" "${3:-}" ;;
+  chat) cmd_chat "${2:-}" "${3:-}" ;;
+  hide) shift; cmd_hide "$@" ;;
+  show) shift; cmd_show "$@" ;;
+  install) cmd_install ;;
+  update) shift; cmd_update "$@" ;;
+  uninstall) cmd_uninstall ;;
+  *) usage >&2; exit 2 ;;
+esac

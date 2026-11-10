@@ -1,0 +1,17 @@
+#!/bin/sh
+# Measures one installed or test-idle agent against the CPU budget. Defaults to the 600 s done-bar window.
+# Usage: scripts/measure-cpu PID [STATE_DIR] [--seconds N] [--json PATH]
+set -eu
+repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+if [ "$#" -lt 1 ]; then
+  echo 'Usage: scripts/measure-cpu PID [STATE_DIR] [--seconds N] [--json PATH]' >&2
+  exit 2
+fi
+pid=$1; shift
+state="$HOME/Library/Application Support/clawd-pet"
+case "${1:-}" in ""|--*) ;; *) state=$1; shift ;; esac
+for tool in "$repo/.build/release/clawd-measure-cpu" "$repo/.build/debug/clawd-measure-cpu"; do
+  if [ -x "$tool" ]; then exec "$tool" "$pid" "$state" "$@"; fi
+done
+echo 'clawd-measure-cpu is not built; run swift build' >&2
+exit 2

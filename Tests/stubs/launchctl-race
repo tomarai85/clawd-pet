@@ -1,0 +1,44 @@
+#!/bin/sh
+# Stub launchctl for the start-versus-uninstall race test. Like Tests/stubs/launchctl, with the three rules of the real launchd that
+# the race depends on:
+#   bootstrap loads the job only while its plist file exists (launchd cannot load a plist that is gone);
+#   kickstart starts the job: it runs "$STUB_AGENT_EXEC --test-hold 30" in the background and records the pid in STUB_AGENT_PIDFILE;
+#   bootout unloads the job and stops that process.
+# The only process this stub ever signals is the one it started itself: the pid it recorded, and only while that process's command
+# line still names STUB_AGENT_EXEC.
+echo "launchctl $*" >> "$STUB_LOG"
+[ -z "${STUB_SHELL_LOG:-}" ] || /bin/ps -o comm= -p "$PPID" >> "$STUB_SHELL_LOG"
+case "$1" in
+  list)
+    if [ -f "$STUB_STATE" ]; then
+      printf '{\n\t"Label" = "com.tomtim.clawd-pet";\n\t"PID" = 4242;\n};\n'
+      exit 0
+    fi
+    exit 113 ;;
+  bootstrap)
+    [ -f "${3:-}" ] || { echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; }
+    : > "$STUB_STATE"; exit 0 ;;
+  kickstart)
+    [ -f "$STUB_STATE" ] || { echo "Could not find service" >&2; exit 113; }
+    if [ -x "${STUB_AGENT_EXEC:-}" ]; then
+      "$STUB_AGENT_EXEC" --test-hold 30 >/dev/null 2>&1 </dev/null &
+      echo $! > "$STUB_AGENT_PIDFILE"
+    fi
+    exit 0 ;;
+  bootout)
+    if [ -f "${STUB_AGENT_PIDFILE:-/nonexistent}" ]; then
+      pid=$(cat "$STUB_AGENT_PIDFILE")
+      case "$pid" in
+        ''|*[!0-9]*) ;;
+        *)
+          if /bin/ps -o command= -p "$pid" 2>/dev/null | grep -qF -- "$STUB_AGENT_EXEC"; then
+            kill "$pid" 2>/dev/null
+            n=0
+            while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 1200 ]; do sleep 0.05; n=$((n + 1)); done
+          fi ;;
+      esac
+    fi
+    /bin/rm -f "$STUB_STATE"
+    exit 0 ;;
+esac
+exit 0

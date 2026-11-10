@@ -1,0 +1,5 @@
+#!/bin/sh
+# Stands in for the built agent in the interrupt tests (a few bytes instead of a Mach-O, so hundreds of fake installs stay small).
+# Logs that the installed copy answered, then runs the real agent so that --own-pids is the real enumeration for this HOME.
+echo installed >> "${STUB_ENUM_LOG:-/dev/null}"
+exec "$CLAWD_TEST_REAL_AGENT" "$@"

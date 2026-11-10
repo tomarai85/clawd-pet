@@ -1,0 +1,6 @@
+#!/bin/sh
+# Hook for the start-versus-uninstall race test: the user runs `clawd-pet start` from another terminal at the moment the shim chooses.
+# OPSHIM_HOOK_BASH is the interpreter under test, OPSHIM_HOOK_CLI the CLI, OPSHIM_HOOK_OUT / OPSHIM_HOOK_RC receive its output and
+# exit status. The HOME and the stub launchctl are the ones the uninstall under test already runs with.
+"$OPSHIM_HOOK_BASH" "$OPSHIM_HOOK_CLI" start > "$OPSHIM_HOOK_OUT" 2>&1
+echo $? > "$OPSHIM_HOOK_RC"

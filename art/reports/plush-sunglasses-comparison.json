@@ -1,0 +1,44 @@
+{
+  "picture": "sources/plush/sunglasses",
+  "ext": "png",
+  "sha256": "f61fdd6d81d815225718ead4a1c72c6c3c2dbf163819158df57a54ca6c6eea05",
+  "rules": {
+    "blackMax": 60,
+    "mergePx": 2,
+    "barMin": 0.85,
+    "lensMin": 0.15,
+    "colourTolerance": 12,
+    "gapTolerance": 0.1,
+    "widthTolerance": 0.25,
+    "headRowsAbove": 12
+  },
+  "plush": {
+    "blackBox": [112, 189, 367, 283],
+    "blackMean": [18, 10, 13],
+    "headWidthPx": 253,
+    "width": 256,
+    "height": 95,
+    "barRow": 39,
+    "lensRows": 29,
+    "bridgeFraction": 0.066
+  },
+  "pet": {
+    "cells": [18, 3],
+    "colours": [[20, 20, 19]],
+    "torsoCells": 16,
+    "width": 18,
+    "height": 3,
+    "barRow": 0,
+    "lensRows": 2,
+    "bridgeFraction": 0.111
+  },
+  "widthOverHead": {
+    "plush": 1.012,
+    "pet": 1.125
+  },
+  "heightOverWidth": {
+    "plush": 0.371,
+    "pet": 0.167
+  },
+  "verdict": "match"
+}

@@ -1,0 +1,21 @@
+#!/bin/sh
+# Stand-in for the agent's settings applier in the CLI tests (the real one is the agent's SettingsWatcher). It polls control.json
+# and, DELAY seconds after a new `generation` shows up, writes appliedGeneration to status.json through a rename.
+#   status-writer ROOT DELAY_S [MAX_GENERATION]
+# With MAX_GENERATION it never applies a generation above it (an applier that has stopped working). It runs until its parent test
+# stops it, by the pid the test recorded.
+root="${1:?root}"; delay="${2:-0}"; max="${3:-}"
+# What is in control.json when this starts counts as applied already (the agent that is "running" has applied it).
+applied="$(/usr/bin/plutil -extract generation raw -o - "$root/control.json" 2>/dev/null)"
+case "$applied" in ''|*[!0-9]*) applied=0 ;; esac
+printf '{"focusViolations":0,"wakeCount":0,"displayChangeCount":0,"appliedGeneration":%s}\n' "$applied" > "$root/status.json.new" && mv "$root/status.json.new" "$root/status.json"
+while :; do
+  gen="$(/usr/bin/plutil -extract generation raw -o - "$root/control.json" 2>/dev/null)"
+  case "$gen" in ''|*[!0-9]*) gen=0 ;; esac
+  if [ "$gen" -gt "$applied" ] && { [ -z "$max" ] || [ "$gen" -le "$max" ]; }; then
+    sleep "$delay"
+    printf '{"focusViolations":0,"wakeCount":0,"displayChangeCount":0,"appliedGeneration":%s}\n' "$gen" > "$root/status.json.new" && mv "$root/status.json.new" "$root/status.json"
+    applied="$gen"
+  fi
+  sleep 0.02
+done

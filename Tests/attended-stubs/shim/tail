@@ -1,0 +1,8 @@
+#!/bin/bash
+# `tail` for the attended-check test of a log that keeps rotating while the script reads it (this directory goes first in PATH). It is
+# the real tail. While $STUB_DIR/tail.rotate exists, every call of the form `tail -c +N FILE` first runs the shell command in
+# $STUB_DIR/tail.hook (a rotation of agent.log). Without that file it is the real tail and nothing else.
+if [ "${1:-}" = -c ] && [ "$#" -eq 3 ] && [ -e "$STUB_DIR/tail.rotate" ] && [ -f "$STUB_DIR/tail.hook" ]; then
+  /bin/bash "$STUB_DIR/tail.hook"
+fi
+exec /usr/bin/tail "$@"
